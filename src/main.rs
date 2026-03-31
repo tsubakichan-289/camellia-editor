@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 const BUNDLED_LATEXMKRC: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/latexmkrc"));
 const MATH_PREVIEW_IDLE_DELAY: Duration = Duration::from_millis(50);
+const PDF_PREVIEW_DPI: f32 = 144.0;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -553,6 +554,41 @@ impl TexEditorApp {
             }
             Err(err) => {
                 self.status_message = format!("Template copy failed: {err}");
+            }
+        }
+    }
+
+    fn jump_to_tex_from_pdf_click(
+        &mut self,
+        pdf_path: &Path,
+        page: usize,
+        x_bp: f32,
+        y_bp: f32,
+    ) {
+        match synctex_edit(pdf_path, page, x_bp, y_bp) {
+            Ok(result) => {
+                let target_path = if result.input.is_absolute() {
+                    result.input
+                } else {
+                    pdf_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(result.input)
+                };
+                let target_char = line_start_char_for_path(&target_path, result.line).unwrap_or(0);
+                self.open_document_at_path(target_path.clone());
+                self.pending_cursor_jump = Some(target_char);
+                self.pending_scroll_jump = Some(target_char);
+                self.active_center_tab = CenterPanelTab::Tex;
+                self.status_message = format!(
+                    "Synced PDF page {} to {}:{}",
+                    page,
+                    display_name(&target_path),
+                    result.line
+                );
+            }
+            Err(err) => {
+                self.status_message = format!("PDF sync failed: {err}");
             }
         }
     }
@@ -2365,19 +2401,44 @@ impl TexEditorApp {
             ui.add_space(6.0);
 
             if self.active_center_tab == CenterPanelTab::Pdf {
+                let preview_pdf_path = current_pdf_preview_path(
+                    self.current_path.as_deref(),
+                    self.selected_pdf_path.as_deref(),
+                );
+                let mut reverse_sync_request = None;
                 ScrollArea::vertical()
                     .id_salt("pdf_preview_scroll")
                     .show(ui, |ui| {
                         if !self.pdf_preview_textures.is_empty() {
                             ui.vertical_centered(|ui| {
-                                for texture in &self.pdf_preview_textures {
+                                for (page_index, texture) in self.pdf_preview_textures.iter().enumerate() {
                                     let available_width = ui.available_width().max(1.0);
                                     let texture_size = texture.size_vec2();
                                     let scale = (available_width / texture_size.x).min(1.0);
                                     let size = texture_size * scale;
-                                    ui.add(
-                                        egui::Image::from_texture(texture).fit_to_exact_size(size),
+                                    let response = ui.add(
+                                        egui::Image::from_texture(texture)
+                                            .fit_to_exact_size(size)
+                                            .sense(egui::Sense::click()),
                                     );
+                                    if response.clicked() {
+                                        if let (Some(pointer_pos), Some(pdf_path)) =
+                                            (response.interact_pointer_pos(), preview_pdf_path.as_deref())
+                                        {
+                                            let local_x = (pointer_pos.x - response.rect.min.x)
+                                                .clamp(0.0, response.rect.width());
+                                            let local_y = (pointer_pos.y - response.rect.min.y)
+                                                .clamp(0.0, response.rect.height());
+                                            let image_x = local_x / response.rect.width() * texture_size.x;
+                                            let image_y = local_y / response.rect.height() * texture_size.y;
+                                            reverse_sync_request = Some((
+                                                pdf_path.to_path_buf(),
+                                                page_index + 1,
+                                                image_x * 72.0 / PDF_PREVIEW_DPI,
+                                                image_y * 72.0 / PDF_PREVIEW_DPI,
+                                            ));
+                                        }
+                                    }
                                     ui.add_space(12.0);
                                 }
                             });
@@ -2387,6 +2448,9 @@ impl TexEditorApp {
                             ui.label("No PDF");
                         }
                     });
+                if let Some((pdf_path, page, x_bp, y_bp)) = reverse_sync_request {
+                    self.jump_to_tex_from_pdf_click(&pdf_path, page, x_bp, y_bp);
+                }
                 return;
             }
 
@@ -2858,6 +2922,11 @@ struct ResolvedBuildTool {
     path: String,
 }
 
+struct SyncTexEditResult {
+    input: PathBuf,
+    line: usize,
+}
+
 fn render_math_preview_image(
     preview: &MathPreview,
     preamble: &str,
@@ -3176,6 +3245,50 @@ fn render_pdf_preview_images(pdf_path: &Path) -> Result<Vec<egui::ColorImage>, S
                 .map_err(|err| format!("Could not parse PDF preview page `{}`: {err}", path.display()))
         })
         .collect()
+}
+
+fn synctex_edit(pdf_path: &Path, page: usize, x_bp: f32, y_bp: f32) -> Result<SyncTexEditResult, String> {
+    let synctex = resolve_command_path("synctex")
+        .ok_or_else(|| "`synctex` was not found on PATH or known install paths.".to_owned())?;
+    let output = configure_command(Command::new(&synctex))
+        .args([
+            "edit",
+            "-o",
+            &format!("{page}:{:.2}:{:.2}:{}", x_bp, y_bp, pdf_path.display()),
+        ])
+        .output()
+        .map_err(|err| format!("Could not launch `{synctex}`: {err}"))?;
+
+    if !output.status.success() {
+        return Err(summarize_command_output(&output.stdout, &output.stderr));
+    }
+
+    parse_synctex_edit_output(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| "Could not parse synctex output".to_owned())
+}
+
+fn parse_synctex_edit_output(output: &str) -> Option<SyncTexEditResult> {
+    let mut input = None;
+    let mut line = None;
+
+    for raw_line in output.lines() {
+        let line_text = raw_line.trim();
+        if let Some(value) = line_text.strip_prefix("Input:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                input = Some(PathBuf::from(value));
+            }
+        } else if let Some(value) = line_text.strip_prefix("Line:") {
+            if let Ok(parsed) = value.trim().parse::<usize>() {
+                line = Some(parsed.max(1));
+            }
+        }
+    }
+
+    Some(SyncTexEditResult {
+        input: input?,
+        line: line?,
+    })
 }
 
 fn discover_template_entries() -> Vec<TemplateEntry> {
@@ -5113,6 +5226,11 @@ fn line_start_char(text: &str, line: usize) -> usize {
     text.chars().count()
 }
 
+fn line_start_char_for_path(path: &Path, line: usize) -> Option<usize> {
+    let text = fs::read_to_string(path).ok()?;
+    Some(line_start_char(&text, line))
+}
+
 fn char_index_to_line(text: &str, char_index: usize) -> usize {
     text.chars()
         .take(char_index)
@@ -5834,6 +5952,14 @@ fn static_fallback_command_paths(command: &str) -> Vec<PathBuf> {
             PathBuf::from("/usr/bin/tectonic"),
             PathBuf::from("/usr/local/bin/tectonic"),
             PathBuf::from("/opt/homebrew/bin/tectonic"),
+        ],
+        "synctex" => vec![
+            PathBuf::from(r"C:\texlive\2025\bin\windows\synctex.exe"),
+            PathBuf::from(r"C:\texlive\2024\bin\windows\synctex.exe"),
+            PathBuf::from(r"C:\texlive\2023\bin\windows\synctex.exe"),
+            PathBuf::from("/usr/bin/synctex"),
+            PathBuf::from("/usr/local/bin/synctex"),
+            PathBuf::from("/Library/TeX/texbin/synctex"),
         ],
         "git" => vec![
             PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"),

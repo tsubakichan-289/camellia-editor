@@ -1,5 +1,5 @@
 #define AppName "camellia-editor"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define AppPublisher "tsubakichan-289"
 #define AppExeName "camellia-editor.exe"
 #define AppDir "camellia-editor"
