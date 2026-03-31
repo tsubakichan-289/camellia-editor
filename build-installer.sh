@@ -21,13 +21,21 @@ fi
 echo "[2/4] update packaged exe"
 install -Dm755 "${TARGET_EXE}" "${APP_DIR}/${EXE_NAME}"
 
-echo "[3/4] verify installer inputs"
+echo "[3/5] sync bundled templates"
+rm -rf "${APP_DIR}/templates"
+if [[ -d "${ROOT_DIR}/templates" ]]; then
+  mkdir -p "${APP_DIR}"
+  cp -R "${ROOT_DIR}/templates" "${APP_DIR}/templates"
+fi
+
+echo "[4/5] verify installer inputs"
 required_files=(
   "${APP_DIR}/${EXE_NAME}"
   "${APP_DIR}/hunspell.exe"
   "${APP_DIR}/texlab.exe"
   "${APP_DIR}/en_US.aff"
   "${APP_DIR}/en_US.dic"
+  "${APP_DIR}/templates"
 )
 
 for file in "${required_files[@]}"; do
@@ -42,7 +50,7 @@ if [[ ! -x "${ISCC_EXE}" && ! -f "${ISCC_EXE}" ]]; then
   exit 1
 fi
 
-echo "[4/4] build installer"
+echo "[5/5] build installer"
 if command -v wslpath >/dev/null 2>&1; then
   ISS_FILE="$(wslpath -w "${ISS_FILE}")"
 fi

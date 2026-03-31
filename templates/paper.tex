@@ -1,0 +1,239 @@
+\documentclass[11pt,a4paper]{article}
+
+% ---------- Packages ----------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=25mm]{geometry}
+\usepackage{setspace}
+\usepackage{amsmath,amssymb,amsfonts,amsthm,mathtools}
+\usepackage{mathrsfs}
+\usepackage{bm}
+\usepackage{enumerate}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{cite}
+
+% ---------- Line spacing ----------
+\onehalfspacing
+
+% ---------- Hyperref ----------
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue,
+  pdftitle={Title of the Paper},
+  pdfauthor={Author Name}
+}
+
+% ---------- Theorem environments ----------
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\newtheorem{example}[theorem]{Example}
+\newtheorem{remark}[theorem]{Remark}
+
+% ---------- Custom commands ----------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Q}{\mathbb{Q}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\C}{\mathbb{C}}
+\newcommand{\F}{\mathbb{F}}
+
+\newcommand{\eps}{\varepsilon}
+\newcommand{\To}{\Rightarrow}
+\newcommand{\into}{\hookrightarrow}
+\newcommand{\onto}{\twoheadrightarrow}
+
+\newcommand{\GL}{\mathrm{GL}}
+\newcommand{\SL}{\mathrm{SL}}
+\newcommand{\PSL}{\mathrm{PSL}}
+\newcommand{\Aut}{\mathrm{Aut}}
+\newcommand{\Hom}{\mathrm{Hom}}
+\newcommand{\End}{\mathrm{End}}
+\newcommand{\Ker}{\mathrm{Ker}}
+\newcommand{\Img}{\mathrm{Im}}
+\newcommand{\tr}{\mathrm{tr}}
+\newcommand{\rank}{\mathrm{rank}}
+\newcommand{\ord}{\mathrm{ord}}
+
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\set}[1]{\left\{ #1 \right\}}
+\newcommand{\angles}[1]{\left\langle #1 \right\rangle}
+\newcommand{\paren}[1]{\left( #1 \right)}
+\newcommand{\bracket}[1]{\left[ #1 \right]}
+
+% ---------- Title ----------
+\title{\textbf{Title of the Paper}}
+\author{
+  Author Name\\
+  \small Department of Mathematics, University Name\\
+  \small \texttt{author@example.com}
+}
+\date{\today}
+
+% ---------- Document ----------
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We investigate a mathematical problem related to [insert topic].
+The main purpose of this paper is to establish [insert main result].
+Our approach is based on [insert method], and several examples are provided
+to illustrate the theory.
+\end{abstract}
+
+\section{Introduction}
+
+The purpose of this paper is to study [insert topic].
+This subject has been investigated by many authors in various contexts.
+Our main result can be regarded as a refinement of earlier work on
+[insert related topic].
+
+The paper is organized as follows.
+In \Cref{sec:preliminaries}, we collect basic definitions and notation.
+In \Cref{sec:main-results}, we state and prove the main theorem.
+Finally, in \Cref{sec:examples}, we discuss several examples and remarks.
+
+\section{Preliminaries}\label{sec:preliminaries}
+
+We begin with the following definition.
+
+\begin{definition}
+Let $X$ be a set and let $f : X \to X$ be a map.
+We say that $f$ has property \emph{(P)} if
+\[
+  f(x) = x
+\]
+for every $x \in X$ satisfying [insert condition].
+\end{definition}
+
+The following lemma will be used repeatedly.
+
+\begin{lemma}\label{lem:basic}
+Let $V$ be a vector space over $\R$, and let $T \in \End(V)$.
+If $T$ is diagonalizable, then
+\[
+  V = \bigoplus_{\lambda} E_{\lambda},
+\]
+where $E_{\lambda}$ denotes the eigenspace corresponding to the eigenvalue $\lambda$.
+\end{lemma}
+
+\begin{proof}
+This is a standard consequence of the definition of diagonalizability.
+\end{proof}
+
+\section{Main Results}\label{sec:main-results}
+
+We now state the principal theorem of this paper.
+
+\begin{theorem}\label{thm:main}
+Let $G$ be a group acting on a set $X$.
+Assume that [insert assumptions].
+Then the following assertions hold:
+\begin{enumerate}[(i)]
+  \item the action of $G$ on $X$ satisfies [insert property];
+  \item for every $x \in X$, the stabilizer subgroup $G_x$ has [insert property];
+  \item there exists a natural bijection between [insert objects].
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+We divide the proof into several steps.
+
+\medskip
+\noindent
+\textbf{Step 1.}
+First, we prove that [insert claim].
+By \Cref{lem:basic}, we have
+\[
+  V = \bigoplus_{\lambda} E_{\lambda}.
+\]
+
+\medskip
+\noindent
+\textbf{Step 2.}
+Next, we show that [insert claim].
+For any $x \in X$, one obtains
+\[
+  \phi(x) = \sum_{n=0}^{\infty} a_n x^n,
+\]
+whenever the series converges.
+
+\medskip
+\noindent
+\textbf{Step 3.}
+Combining the previous steps, we conclude that the desired statement follows.
+\end{proof}
+
+As an immediate consequence, we obtain the following.
+
+\begin{corollary}
+Under the assumptions of \Cref{thm:main}, the object [insert object]
+is uniquely determined up to isomorphism.
+\end{corollary}
+
+\begin{proof}
+This follows directly from \Cref{thm:main}.
+\end{proof}
+
+\section{Examples and Remarks}\label{sec:examples}
+
+We present a simple example.
+
+\begin{example}
+Let $G = \SL_2(\Z)$.
+Then $G$ acts naturally on the upper half-plane by fractional linear transformations:
+\[
+  z \mapsto \frac{az+b}{cz+d}
+  \qquad
+  \left(
+    \begin{pmatrix}
+      a & b\\
+      c & d
+    \end{pmatrix}
+    \in \SL_2(\Z)
+  \right).
+\]
+This provides a classical source of examples in the theory of modular forms.
+\end{example}
+
+\begin{remark}
+The argument given above can be adapted to more general settings,
+for example to [insert generalization].
+\end{remark}
+
+\section*{Acknowledgments}
+
+The author would like to thank [insert names] for valuable discussions.
+
+\begin{thebibliography}{99}
+
+\bibitem{Lang}
+S.~Lang,
+\textit{Algebra},
+Graduate Texts in Mathematics, Springer, 2002.
+
+\bibitem{Serre}
+J.-P.~Serre,
+\textit{A Course in Arithmetic},
+Graduate Texts in Mathematics, Springer, 1973.
+
+\bibitem{Hartshorne}
+R.~Hartshorne,
+\textit{Algebraic Geometry},
+Graduate Texts in Mathematics, Springer, 1977.
+
+\end{thebibliography}
+
+\end{document}

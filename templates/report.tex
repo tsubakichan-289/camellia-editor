@@ -1,0 +1,133 @@
+\documentclass[a4paper,11pt]{ltjsarticle}
+
+% ---------- パッケージ ----------
+\usepackage{luatexja}
+\usepackage{luatexja-fontspec}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{enumitem}
+
+% ---------- 余白 ----------
+\geometry{margin=25mm}
+
+% ---------- フォント ----------
+\setmainjfont{Noto Serif CJK JP} % 日本語
+\setmainfont{Times New Roman}    % 欧文
+
+% ---------- 行間 ----------
+\linespread{1.2}
+
+% ---------- 定理環境 ----------
+\theoremstyle{plain}
+\newtheorem{theorem}{定理}[section]
+\newtheorem{lemma}[theorem]{補題}
+\newtheorem{proposition}[theorem]{命題}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{定義}
+\newtheorem{example}[theorem]{例}
+
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{注意}
+
+% ---------- 数学記号 ----------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\Q}{\mathbb{Q}}
+
+% ---------- タイトル ----------
+\title{\bfseries レポートタイトル}
+\author{所属・氏名}
+\date{\today}
+
+% ---------- 本文 ----------
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本レポートでは，○○について考察する．
+特に，△△の性質および□□との関係を明らかにすることを目的とする．
+\end{abstract}
+
+\section{はじめに}
+
+本レポートでは，○○について扱う．
+この問題は，数学や情報科学において重要な役割を果たす．
+
+\section{準備}
+
+まず，基本的な定義を与える．
+
+\begin{definition}
+集合 $X$ 上の写像 $f : X \to X$ が性質 $(P)$ を満たすとは，
+任意の $x \in X$ に対して
+\[
+  f(x) = x
+\]
+が成り立つことをいう．
+\end{definition}
+
+\begin{lemma}
+$V$ を $\R$ 上のベクトル空間とする．
+$T \in \mathrm{End}(V)$ が対角化可能であるとき，
+\[
+  V = \bigoplus_{\lambda} E_{\lambda}
+\]
+が成り立つ．
+\end{lemma}
+
+\begin{proof}
+定義より従う．
+\end{proof}
+
+\section{主結果}
+
+以下が本レポートの主結果である．
+
+\begin{theorem}
+仮定として○○が成り立つとする．
+このとき，次が成立する：
+\begin{enumerate}[label=(\arabic*)]
+  \item ○○が成り立つ
+  \item △△が成立する
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+証明は以下の通りである．
+
+まず，○○を示す．
+次に，△△を示す．
+
+したがって，定理が成立する．
+\end{proof}
+
+\section{例}
+
+\begin{example}
+$G = \mathrm{SL}_2(\Z)$ は，上半平面に自然に作用する：
+\[
+  z \mapsto \frac{az+b}{cz+d}
+\]
+\end{example}
+
+\section{まとめ}
+
+本レポートでは，○○について考察した．
+今後の課題として，□□の拡張が考えられる．
+
+\begin{thebibliography}{9}
+
+\bibitem{sample}
+著者名，
+\textit{書名}，
+出版社，年．
+
+\end{thebibliography}
+
+\end{document}

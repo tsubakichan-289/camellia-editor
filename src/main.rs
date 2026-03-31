@@ -85,6 +85,14 @@ fn recent_directories_path() -> Option<PathBuf> {
     app_state_dir().map(|dir| dir.join("recent-directories.json"))
 }
 
+fn settings_path() -> Option<PathBuf> {
+    app_state_dir().map(|dir| dir.join("settings.json"))
+}
+
+fn writable_templates_path() -> Option<PathBuf> {
+    app_state_dir().map(|dir| dir.join("templates"))
+}
+
 fn load_recent_directories() -> Vec<PathBuf> {
     let Some(path) = recent_directories_path() else {
         return Vec::new();
@@ -121,6 +129,110 @@ fn save_recent_directories(paths: &[PathBuf]) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildToolPreference {
+    Auto,
+    Latexmk,
+    Tectonic,
+}
+
+impl BuildToolPreference {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Latexmk => "latexmk",
+            Self::Tectonic => "tectonic",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "latexmk" => Self::Latexmk,
+            "tectonic" => Self::Tectonic,
+            _ => Self::Auto,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Latexmk => "latexmk",
+            Self::Tectonic => "tectonic",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AppSettings {
+    spellcheck_enabled: bool,
+    preferred_dictionary: Option<String>,
+    build_tool: BuildToolPreference,
+    open_pdf_after_build: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            spellcheck_enabled: true,
+            preferred_dictionary: None,
+            build_tool: BuildToolPreference::Auto,
+            open_pdf_after_build: true,
+        }
+    }
+}
+
+fn load_app_settings() -> AppSettings {
+    let Some(path) = settings_path() else {
+        return AppSettings::default();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return AppSettings::default();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return AppSettings::default();
+    };
+
+    let mut settings = AppSettings::default();
+    if let Some(enabled) = value.get("spellcheck_enabled").and_then(Value::as_bool) {
+        settings.spellcheck_enabled = enabled;
+    }
+    if let Some(dictionary) = value.get("preferred_dictionary").and_then(Value::as_str) {
+        let dictionary = dictionary.trim();
+        if !dictionary.is_empty() {
+            settings.preferred_dictionary = Some(dictionary.to_owned());
+        }
+    }
+    if let Some(build_tool) = value.get("build_tool").and_then(Value::as_str) {
+        settings.build_tool = BuildToolPreference::from_str(build_tool);
+    }
+    if let Some(open_pdf_after_build) = value.get("open_pdf_after_build").and_then(Value::as_bool) {
+        settings.open_pdf_after_build = open_pdf_after_build;
+    }
+    settings
+}
+
+fn save_app_settings(settings: &AppSettings) {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let value = json!({
+        "spellcheck_enabled": settings.spellcheck_enabled,
+        "preferred_dictionary": settings.preferred_dictionary,
+        "build_tool": settings.build_tool.as_str(),
+        "open_pdf_after_build": settings.open_pdf_after_build,
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&value) {
+        let _ = fs::write(path, text);
+    }
+}
+
 fn launch_target_path() -> Option<PathBuf> {
     std::env::args_os()
         .nth(1)
@@ -142,6 +254,9 @@ fn configure_command(command: Command) -> Command {
 }
 
 struct TexEditorApp {
+    settings: AppSettings,
+    show_settings_window: bool,
+    show_templates_window: bool,
     text: String,
     current_path: Option<PathBuf>,
     file_buffers: HashMap<PathBuf, EditorBuffer>,
@@ -173,6 +288,13 @@ struct TexEditorApp {
     pdf_preview_render_error: Option<String>,
     pdf_preview_render_key: Option<String>,
     selected_pdf_path: Option<PathBuf>,
+    template_entries: Vec<TemplateEntry>,
+    selected_template_tex_path: Option<PathBuf>,
+    template_copy_file_name: String,
+    template_preview_textures: Vec<TextureHandle>,
+    template_preview_render_error: Option<String>,
+    template_preview_render_key: Option<String>,
+    template_delete_confirm_path: Option<PathBuf>,
     texlab_sender: Option<Sender<TexlabCommand>>,
     texlab_receiver: Option<Receiver<TexlabEvent>>,
     texlab_status: Option<String>,
@@ -217,12 +339,26 @@ enum TreeAction {
     Paste(PathBuf),
     NewFile(PathBuf),
     NewFolder(PathBuf),
+    AddToTemplates(PathBuf),
 }
 
 struct ExternalToolStatus {
     name: &'static str,
     path: Option<String>,
     detail: Option<String>,
+}
+
+#[derive(Clone)]
+struct HunspellDictionary {
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(Clone)]
+struct TemplateEntry {
+    tex_path: PathBuf,
+    pdf_path: PathBuf,
+    label: String,
 }
 
 #[derive(Clone)]
@@ -292,6 +428,160 @@ enum TexlabEvent {
 }
 
 impl TexEditorApp {
+    fn save_settings(&self) {
+        save_app_settings(&self.settings);
+    }
+
+    fn selected_dictionary_name(&self) -> Option<&str> {
+        self.settings.preferred_dictionary.as_deref()
+    }
+
+    fn selected_hunspell_dictionary(&self) -> Option<&'static HunspellDictionary> {
+        let preferred = self.selected_dictionary_name()?;
+        available_hunspell_dictionaries()
+            .iter()
+            .find(|dictionary| dictionary.name == preferred)
+    }
+
+    fn spellcheck_status_label(&self) -> String {
+        if !self.settings.spellcheck_enabled {
+            return "disabled".to_owned();
+        }
+        let config = resolved_hunspell_config(self.selected_dictionary_name());
+        if let Some(config) = config {
+            return format!("{} via hunspell", config.dictionary_name);
+        }
+        if self
+            .selected_dictionary_name()
+            .map(|name| name.starts_with("en_"))
+            .unwrap_or(true)
+            && english_dictionary().is_some()
+        {
+            return self
+                .selected_dictionary_name()
+                .unwrap_or("en_US")
+                .to_owned();
+        }
+        if let Some(name) = self.selected_dictionary_name() {
+            return format!("{name} unavailable");
+        }
+        "no dictionary".to_owned()
+    }
+
+    fn apply_settings_change(&mut self, message: &str) {
+        self.save_settings();
+        self.refresh_analysis();
+        self.refresh_external_tool_statuses();
+        self.status_message = message.to_owned();
+    }
+
+    fn refresh_template_entries(&mut self) {
+        ensure_default_templates_installed();
+        self.template_entries = discover_template_entries();
+        if self.template_entries.is_empty() {
+            self.selected_template_tex_path = None;
+            self.template_copy_file_name.clear();
+            self.template_preview_textures.clear();
+            self.template_preview_render_error = None;
+            self.template_preview_render_key = None;
+            return;
+        }
+
+        let still_exists = self
+            .selected_template_tex_path
+            .as_ref()
+            .map(|selected| self.template_entries.iter().any(|entry| &entry.tex_path == selected))
+            .unwrap_or(false);
+        if !still_exists {
+            self.selected_template_tex_path = self
+                .template_entries
+                .first()
+                .map(|entry| entry.tex_path.clone());
+            self.template_copy_file_name = self
+                .template_entries
+                .first()
+                .map(|entry| template_default_copy_name(&entry.tex_path))
+                .unwrap_or_default();
+            self.template_preview_render_key = None;
+            self.template_preview_render_error = None;
+            self.template_preview_textures.clear();
+        }
+    }
+
+    fn selected_template_entry(&self) -> Option<&TemplateEntry> {
+        let selected = self.selected_template_tex_path.as_ref()?;
+        self.template_entries
+            .iter()
+            .find(|entry| &entry.tex_path == selected)
+    }
+
+    fn copy_selected_template_to_workspace(&mut self) {
+        let Some(entry) = self.selected_template_entry().cloned() else {
+            self.status_message = "No template selected".to_owned();
+            return;
+        };
+
+        let file_name = normalize_template_copy_name(&self.template_copy_file_name);
+        let Some(file_name) = file_name else {
+            self.status_message = "Template copy failed: file name is empty".to_owned();
+            return;
+        };
+
+        let destination_tex = self.working_directory().join(&file_name);
+        let destination_pdf = output_pdf_path(&destination_tex);
+        if destination_tex.exists() || destination_pdf.exists() {
+            self.status_message = format!(
+                "Template copy failed: {} or its PDF already exists",
+                destination_tex.display()
+            );
+            return;
+        }
+
+        let result = copy_path_recursively(&entry.tex_path, &destination_tex)
+            .and_then(|_| copy_path_recursively(&entry.pdf_path, &destination_pdf));
+
+        match result {
+            Ok(()) => {
+                self.mark_file_tree_dirty();
+                self.selected_tree_path = Some(destination_tex.clone());
+                self.status_message =
+                    format!("Copied template into {}", self.working_directory().display());
+            }
+            Err(err) => {
+                self.status_message = format!("Template copy failed: {err}");
+            }
+        }
+    }
+
+    fn request_delete_selected_template(&mut self) {
+        let Some(entry) = self.selected_template_entry() else {
+            self.status_message = "No template selected".to_owned();
+            return;
+        };
+        self.template_delete_confirm_path = Some(entry.tex_path.clone());
+    }
+
+    fn delete_template(&mut self, tex_path: &Path) {
+        let pdf_path = output_pdf_path(tex_path);
+        let tex_result = remove_path_recursively(tex_path);
+        if let Err(err) = tex_result {
+            self.status_message = format!("Template delete failed: {err}");
+            return;
+        }
+        if pdf_path.exists() {
+            if let Err(err) = remove_path_recursively(&pdf_path) {
+                self.status_message = format!("Template PDF delete failed: {err}");
+                return;
+            }
+        }
+
+        self.refresh_template_entries();
+        self.template_preview_render_key = None;
+        self.template_preview_render_error = None;
+        self.template_preview_textures.clear();
+        self.status_message = format!("Deleted template {}", display_name(tex_path));
+    }
+
     fn text_differs_from_saved(&self, path: Option<&Path>, text: &str) -> bool {
         match path {
             Some(path) => fs::read_to_string(path)
@@ -510,6 +800,7 @@ impl TexEditorApp {
             &self.text,
             self.last_cursor_index
                 .map(|cursor| char_index_to_line(&self.text, cursor)),
+            &self.settings,
         );
     }
 
@@ -542,8 +833,7 @@ impl TexEditorApp {
             ExternalToolStatus {
                 name: "hunspell",
                 path: resolve_command_path("hunspell"),
-                detail: hunspell_config()
-                    .map(|config| config.dictionary_name.clone()),
+                detail: Some(self.spellcheck_status_label()),
             },
             ExternalToolStatus {
                 name: "git",
@@ -749,30 +1039,31 @@ impl TexEditorApp {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.working_directory());
 
-        let (tool, args) = if let Some(tool) = resolve_command_path("latexmk") {
-            match latexmk_build_args(&path, &project_root) {
-                Ok(args) => (tool, args),
-                Err(err) => {
-                    self.status_message = format!("Build failed: {err}");
-                    self.build_log = format!("{err}\n");
-                    return;
-                }
-            }
-        } else if let Some(tool) = resolve_command_path("tectonic") {
-            (tool, vec![file_name_for_build(&path)])
-        } else {
+        let Some(tool) = resolve_preferred_build_tool(self.settings.build_tool) else {
             self.status_message = "No TeX build tool found".to_owned();
             self.build_log =
                 "Install `latexmk` or `tectonic`, or place them at a known path, to build from this editor.\n"
                     .to_owned();
             return;
         };
+        let args = if tool.kind == BuildToolPreference::Latexmk {
+            match latexmk_build_args(&path, &project_root) {
+                Ok(args) => args,
+                Err(err) => {
+                    self.status_message = format!("Build failed: {err}");
+                    self.build_log = format!("{err}\n");
+                    return;
+                }
+            }
+        } else {
+            vec![file_name_for_build(&path)]
+        };
 
-        self.build_tool = Some(tool.clone());
-        self.status_message = format!("Building with {}", display_name(Path::new(&tool)));
+        self.build_tool = Some(tool.path.clone());
+        self.status_message = format!("Building with {}", display_name(Path::new(&tool.path)));
         self.build_running = true;
         self.last_build_result = None;
-        self.build_log = format!("$ {} {}\n\nBuilding...\n", tool, args.join(" "));
+        self.build_log = format!("$ {} {}\n\nBuilding...\n", tool.path, args.join(" "));
 
         let (sender, receiver) = mpsc::channel();
         self.build_receiver = Some(receiver);
@@ -780,7 +1071,7 @@ impl TexEditorApp {
         let build_root = project_root.clone();
         let path_for_result = path.clone();
         std::thread::spawn(move || {
-            let outcome = run_build_command(tool, args, build_root, path_for_result);
+            let outcome = run_build_command(tool.path, args, build_root, path_for_result);
             let _ = sender.send(outcome);
         });
     }
@@ -799,6 +1090,10 @@ impl TexEditorApp {
                 self.last_build_result = Some(outcome.success);
                 if outcome.success {
                     self.pdf_preview_render_key = None;
+                    self.selected_pdf_path = outcome.pdf_path.clone();
+                    if self.settings.open_pdf_after_build && outcome.pdf_path.is_some() {
+                        self.active_center_tab = CenterPanelTab::Pdf;
+                    }
                 }
             }
             Err(TryRecvError::Empty) => {}
@@ -859,6 +1154,13 @@ impl TexEditorApp {
                 if ui.button("Refresh Tools").clicked() {
                     self.refresh_external_tool_statuses();
                 }
+                if ui.button("Settings").clicked() {
+                    self.show_settings_window = true;
+                }
+                if ui.button("Templates").clicked() {
+                    self.refresh_template_entries();
+                    self.show_templates_window = true;
+                }
                 if ui.button("Save").clicked() {
                     self.save_document();
                 }
@@ -893,6 +1195,296 @@ impl TexEditorApp {
                 ui.label(RichText::new(save_text).color(save_color).strong());
             });
         });
+    }
+
+    fn show_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings_window {
+            return;
+        }
+
+        let mut open = self.show_settings_window;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .default_width(420.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("Spell Check");
+                ui.add_space(6.0);
+
+                let mut spellcheck_enabled = self.settings.spellcheck_enabled;
+                if ui.checkbox(&mut spellcheck_enabled, "Enable spell check").changed() {
+                    self.settings.spellcheck_enabled = spellcheck_enabled;
+                    self.apply_settings_change("Updated spell check setting");
+                }
+
+                let available_dictionaries = available_hunspell_dictionaries();
+                let current_dictionary = self
+                    .settings
+                    .preferred_dictionary
+                    .clone()
+                    .unwrap_or_else(|| "Auto".to_owned());
+
+                egui::ComboBox::from_label("Dictionary language")
+                    .selected_text(dictionary_display_label(&current_dictionary))
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(self.settings.preferred_dictionary.is_none(), "Auto")
+                            .clicked()
+                        {
+                            self.settings.preferred_dictionary = None;
+                            self.apply_settings_change("Using automatic dictionary selection");
+                        }
+
+                        for dictionary in available_dictionaries {
+                            let selected = self.settings.preferred_dictionary.as_deref()
+                                == Some(dictionary.name.as_str());
+                            if ui
+                                .selectable_label(selected, dictionary_display_label(&dictionary.name))
+                                .clicked()
+                            {
+                                self.settings.preferred_dictionary = Some(dictionary.name.clone());
+                                self.apply_settings_change("Updated spell check dictionary");
+                            }
+                        }
+                    });
+
+                ui.small(format!("Current backend: {}", self.spellcheck_status_label()));
+                if let Some(dictionary) = self.selected_hunspell_dictionary() {
+                    ui.small(format!("Dictionary file: {}", dictionary.path.display()));
+                } else if available_dictionaries.is_empty() {
+                    ui.small("No Hunspell dictionaries were found. English fallback stays available when possible.");
+                }
+
+                ui.separator();
+                ui.heading("Build");
+                ui.add_space(6.0);
+
+                egui::ComboBox::from_label("Preferred build tool")
+                    .selected_text(self.settings.build_tool.label())
+                    .show_ui(ui, |ui| {
+                        for option in [
+                            BuildToolPreference::Auto,
+                            BuildToolPreference::Latexmk,
+                            BuildToolPreference::Tectonic,
+                        ] {
+                            if ui
+                                .selectable_label(self.settings.build_tool == option, option.label())
+                                .clicked()
+                            {
+                                self.settings.build_tool = option;
+                                self.apply_settings_change("Updated build tool preference");
+                            }
+                        }
+                    });
+
+                let mut open_pdf_after_build = self.settings.open_pdf_after_build;
+                if ui
+                    .checkbox(
+                        &mut open_pdf_after_build,
+                        "Switch to PDF preview automatically after successful build",
+                    )
+                    .changed()
+                {
+                    self.settings.open_pdf_after_build = open_pdf_after_build;
+                    self.apply_settings_change("Updated build preview setting");
+                }
+
+                ui.separator();
+                ui.heading("Environment");
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "Detected dictionaries: {}",
+                    available_dictionaries.len()
+                ));
+                ui.label(format!(
+                    "Detected build tools: {}",
+                    describe_detected_build_tools()
+                ));
+            });
+        self.show_settings_window = open;
+    }
+
+    fn sync_template_preview_render(&mut self, ctx: &egui::Context) {
+        let Some(entry) = self.selected_template_entry().cloned() else {
+            self.template_preview_textures.clear();
+            self.template_preview_render_error = None;
+            self.template_preview_render_key = None;
+            return;
+        };
+        if !entry.pdf_path.exists() {
+            self.template_preview_textures.clear();
+            self.template_preview_render_error =
+                Some(format!("Missing PDF: {}", entry.pdf_path.display()));
+            self.template_preview_render_key = None;
+            return;
+        }
+
+        let render_key = pdf_render_cache_key(&entry.pdf_path);
+        if self.template_preview_render_key.as_deref() == Some(render_key.as_str()) {
+            return;
+        }
+
+        self.template_preview_render_key = Some(render_key);
+        match render_pdf_preview_images(&entry.pdf_path) {
+            Ok(images) => {
+                self.template_preview_textures = images
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, image)| {
+                        ctx.load_texture(
+                            format!("template_pdf_preview_texture_{index}"),
+                            image,
+                            TextureOptions::LINEAR,
+                        )
+                    })
+                    .collect();
+                self.template_preview_render_error = None;
+            }
+            Err(err) => {
+                self.template_preview_textures.clear();
+                self.template_preview_render_error = Some(err);
+            }
+        }
+    }
+
+    fn show_templates_window(&mut self, ctx: &egui::Context) {
+        if !self.show_templates_window {
+            return;
+        }
+
+        let modal_open = self.template_delete_confirm_path.is_some();
+        let mut open = self.show_templates_window;
+        egui::Window::new("Templates")
+            .open(&mut open)
+            .default_size(egui::vec2(960.0, 680.0))
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!modal_open, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Template Browser");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Refresh").clicked() {
+                                self.refresh_template_entries();
+                                self.status_message = "Refreshed templates".to_owned();
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+
+                    if self.template_entries.is_empty() {
+                        ui.label("No templates found under the installed templates folder.");
+                        ui.small("Expected layout: templates/*.tex and templates/**/out/*.pdf");
+                        return;
+                    }
+
+                    self.sync_template_preview_render(ctx);
+
+                    ui.columns(2, |columns| {
+                        columns[0].set_min_width(260.0);
+                        columns[0].label(format!("{} template(s)", self.template_entries.len()));
+                        columns[0].add_space(6.0);
+                        ScrollArea::vertical()
+                            .id_salt("templates_list_scroll")
+                            .show(&mut columns[0], |ui| {
+                                for entry in self.template_entries.clone() {
+                                    let selected = self.selected_template_tex_path.as_deref()
+                                        == Some(entry.tex_path.as_path());
+                                    ui.horizontal(|ui| {
+                                        let response = ui.selectable_label(selected, &entry.label);
+                                        if response.clicked() {
+                                            self.selected_template_tex_path = Some(entry.tex_path.clone());
+                                            self.template_copy_file_name =
+                                                template_default_copy_name(&entry.tex_path);
+                                            self.template_preview_render_key = None;
+                                            self.template_preview_render_error = None;
+                                        }
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if ui.small_button("🗑").clicked() {
+                                                self.selected_template_tex_path = Some(entry.tex_path.clone());
+                                                self.request_delete_selected_template();
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+
+                        if let Some(entry) = self.selected_template_entry() {
+                            columns[1].label(RichText::new(&entry.label).strong());
+                            columns[1].small(format!("TeX: {}", entry.tex_path.display()));
+                            columns[1].small(format!("PDF: {}", entry.pdf_path.display()));
+                            columns[1].add_space(8.0);
+                            columns[1].horizontal(|ui| {
+                                ui.label("File name");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.template_copy_file_name)
+                                        .desired_width(220.0),
+                                );
+                                let can_copy = !self.template_copy_file_name.trim().is_empty();
+                                if ui
+                                    .add_enabled(can_copy, egui::Button::new("Copy To Current Folder"))
+                                    .clicked()
+                                {
+                                    self.copy_selected_template_to_workspace();
+                                }
+                            });
+                            columns[1].small(format!(
+                                "Destination: {}",
+                                self.working_directory().display()
+                            ));
+                            columns[1].add_space(8.0);
+                            ScrollArea::vertical()
+                                .id_salt("template_pdf_preview_scroll")
+                                .show(&mut columns[1], |ui| {
+                                    if !self.template_preview_textures.is_empty() {
+                                        ui.vertical_centered(|ui| {
+                                            for texture in &self.template_preview_textures {
+                                                let available_width = ui.available_width().max(1.0);
+                                                let texture_size = texture.size_vec2();
+                                                let scale = (available_width / texture_size.x).min(1.0);
+                                                let size = texture_size * scale;
+                                                ui.add(
+                                                    egui::Image::from_texture(texture)
+                                                        .fit_to_exact_size(size),
+                                                );
+                                                ui.add_space(12.0);
+                                            }
+                                        });
+                                    } else if let Some(error) = &self.template_preview_render_error {
+                                        ui.colored_label(Color32::from_rgb(220, 120, 120), error);
+                                    } else {
+                                        ui.label("PDF preview is not available yet.");
+                                    }
+                                });
+                        }
+                    });
+                });
+            });
+        self.show_templates_window = open;
+    }
+
+    fn show_template_delete_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(tex_path) = self.template_delete_confirm_path.clone() else {
+            return;
+        };
+
+        egui::Window::new("Delete Template")
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("Delete this template?");
+                ui.small(display_name(&tex_path));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        self.template_delete_confirm_path = None;
+                        self.delete_template(&tex_path);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.template_delete_confirm_path = None;
+                    }
+                });
+            });
     }
 
     fn show_math_preview(&mut self, ui: &mut egui::Ui) {
@@ -1202,6 +1794,7 @@ impl TexEditorApp {
             TreeAction::Paste(path) => self.paste_into(&path),
             TreeAction::NewFile(dir) => self.create_tree_entry(&dir, false),
             TreeAction::NewFolder(dir) => self.create_tree_entry(&dir, true),
+            TreeAction::AddToTemplates(path) => self.add_to_templates(&path),
         }
         self.refresh_git_status();
     }
@@ -1315,6 +1908,19 @@ impl TexEditorApp {
                     *tree_action = Some(TreeAction::Delete(node.path.clone()));
                     ui.close_menu();
                 }
+                if node
+                    .path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("tex"))
+                    .unwrap_or(false)
+                {
+                    ui.separator();
+                    if ui.button("add to templates").clicked() {
+                        *tree_action = Some(TreeAction::AddToTemplates(node.path.clone()));
+                        ui.close_menu();
+                    }
+                }
             });
         }
     }
@@ -1347,6 +1953,43 @@ impl TexEditorApp {
             }
             Err(err) => {
                 self.status_message = format!("Create failed: {err}");
+            }
+        }
+    }
+
+    fn add_to_templates(&mut self, tex_path: &Path) {
+        let source_pdf = output_pdf_path(tex_path);
+        if !source_pdf.exists() {
+            self.status_message = format!(
+                "Template add failed: corresponding PDF was not found at {}",
+                source_pdf.display()
+            );
+            return;
+        }
+
+        let templates_root = primary_template_root();
+        let target_tex_name = tex_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("template.tex"));
+        let target_tex_path = unique_destination_path(&templates_root, target_tex_name);
+        let target_pdf_path = output_pdf_path(&target_tex_path);
+
+        let result = copy_path_recursively(tex_path, &target_tex_path)
+            .and_then(|_| copy_path_recursively(&source_pdf, &target_pdf_path));
+
+        match result {
+            Ok(()) => {
+                self.refresh_template_entries();
+                self.selected_template_tex_path = Some(target_tex_path.clone());
+                self.template_preview_render_key = None;
+                self.template_preview_render_error = None;
+                self.template_preview_textures.clear();
+                self.show_templates_window = true;
+                self.status_message =
+                    format!("Added template {}", display_name(&target_tex_path));
+            }
+            Err(err) => {
+                self.status_message = format!("Template add failed: {err}");
             }
         }
     }
@@ -2054,13 +2697,17 @@ impl TexEditorApp {
 
 impl Default for TexEditorApp {
     fn default() -> Self {
+        let settings = load_app_settings();
         let text = String::new();
-        let analysis = analyze_tex(&text, None);
+        let analysis = analyze_tex(&text, None, &settings);
         let active_math_preview = math_preview_at_cursor(&text, 0);
         let (texlab_sender, texlab_receiver, texlab_status) = start_texlab_client()
             .map(|(sender, receiver)| (Some(sender), Some(receiver), Some("starting texlab".to_owned())))
             .unwrap_or((None, None, None));
         let mut app = Self {
+            settings,
+            show_settings_window: false,
+            show_templates_window: false,
             text,
             current_path: None,
             opened_directory: None,
@@ -2092,6 +2739,13 @@ impl Default for TexEditorApp {
             pdf_preview_render_error: None,
             pdf_preview_render_key: None,
             selected_pdf_path: None,
+            template_entries: Vec::new(),
+            selected_template_tex_path: None,
+            template_copy_file_name: String::new(),
+            template_preview_textures: Vec::new(),
+            template_preview_render_error: None,
+            template_preview_render_key: None,
+            template_delete_confirm_path: None,
             texlab_sender,
             texlab_receiver,
             texlab_status,
@@ -2148,6 +2802,9 @@ impl App for TexEditorApp {
         self.sync_math_preview_render(ctx);
         self.sync_pdf_preview_render(ctx);
         self.show_toolbar(ctx);
+        self.show_settings_window(ctx);
+        self.show_templates_window(ctx);
+        self.show_template_delete_confirm_dialog(ctx);
         self.show_workspace_panel(ctx);
         self.show_inspector_panel(ctx);
         self.show_status_bar(ctx);
@@ -2180,11 +2837,17 @@ struct BuildOutcome {
     success: bool,
     status_message: String,
     log: String,
+    pdf_path: Option<PathBuf>,
 }
 
 struct MathPreviewOutcome {
     render_key: String,
     image: Result<egui::ColorImage, String>,
+}
+
+struct ResolvedBuildTool {
+    kind: BuildToolPreference,
+    path: String,
 }
 
 fn render_math_preview_image(
@@ -2294,12 +2957,14 @@ fn run_build_command(
                     success: true,
                     status_message: format!("Build succeeded: {}", output_pdf_path(&path).display()),
                     log,
+                    pdf_path: Some(output_pdf_path(&path)),
                 }
             } else {
                 BuildOutcome {
                     success: false,
                     status_message: format!("Build failed with {tool}"),
                     log,
+                    pdf_path: None,
                 }
             }
         }
@@ -2307,7 +2972,63 @@ fn run_build_command(
             success: false,
             status_message: format!("Build failed: {err}"),
             log: format!("Could not launch {tool}: {err}\n"),
+            pdf_path: None,
         },
+    }
+}
+
+fn resolve_preferred_build_tool(preference: BuildToolPreference) -> Option<ResolvedBuildTool> {
+    let latexmk = resolve_command_path("latexmk");
+    let tectonic = resolve_command_path("tectonic");
+    match preference {
+        BuildToolPreference::Auto => latexmk
+            .map(|path| ResolvedBuildTool {
+                kind: BuildToolPreference::Latexmk,
+                path,
+            })
+            .or_else(|| {
+                tectonic.map(|path| ResolvedBuildTool {
+                    kind: BuildToolPreference::Tectonic,
+                    path,
+                })
+            }),
+        BuildToolPreference::Latexmk => latexmk
+            .map(|path| ResolvedBuildTool {
+                kind: BuildToolPreference::Latexmk,
+                path,
+            })
+            .or_else(|| {
+                tectonic.map(|path| ResolvedBuildTool {
+                    kind: BuildToolPreference::Tectonic,
+                    path,
+                })
+            }),
+        BuildToolPreference::Tectonic => tectonic
+            .map(|path| ResolvedBuildTool {
+                kind: BuildToolPreference::Tectonic,
+                path,
+            })
+            .or_else(|| {
+                latexmk.map(|path| ResolvedBuildTool {
+                    kind: BuildToolPreference::Latexmk,
+                    path,
+                })
+            }),
+    }
+}
+
+fn describe_detected_build_tools() -> String {
+    let mut tools = Vec::new();
+    if resolve_command_path("latexmk").is_some() {
+        tools.push("latexmk");
+    }
+    if resolve_command_path("tectonic").is_some() {
+        tools.push("tectonic");
+    }
+    if tools.is_empty() {
+        "none".to_owned()
+    } else {
+        tools.join(", ")
     }
 }
 
@@ -2362,7 +3083,27 @@ fn current_pdf_preview_path(current_path: Option<&Path>, selected_pdf_path: Opti
 }
 
 fn corresponding_tex_path(pdf_path: &Path) -> Option<PathBuf> {
-    let candidate = pdf_path.with_extension("tex");
+    let candidate = if pdf_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("out"))
+        .unwrap_or(false)
+    {
+        pdf_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."))
+            .join(
+                pdf_path
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("document.pdf")),
+            )
+            .with_extension("tex")
+    } else {
+        pdf_path.with_extension("tex")
+    };
     candidate.exists().then_some(candidate)
 }
 
@@ -2427,6 +3168,159 @@ fn render_pdf_preview_images(pdf_path: &Path) -> Result<Vec<egui::ColorImage>, S
                 .map_err(|err| format!("Could not parse PDF preview page `{}`: {err}", path.display()))
         })
         .collect()
+}
+
+fn discover_template_entries() -> Vec<TemplateEntry> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for templates_dir in template_root_candidates() {
+        collect_template_entries(&templates_dir, &templates_dir, &mut seen, &mut entries);
+    }
+    entries.sort_by(|a, b| a.label.cmp(&b.label));
+    entries
+}
+
+fn template_root_candidates() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(candidate) = writable_templates_path() {
+        if candidate.is_dir() && seen.insert(candidate.clone()) {
+            roots.push(candidate);
+        }
+    }
+    for root in app_search_roots() {
+        let candidate = root.join("templates");
+        if candidate.is_dir() && seen.insert(candidate.clone()) {
+            roots.push(candidate);
+        }
+    }
+    roots
+}
+
+fn primary_template_root() -> PathBuf {
+    writable_templates_path()
+        .or_else(|| app_search_roots().into_iter().next().map(|root| root.join("templates")))
+        .unwrap_or_else(|| PathBuf::from("templates"))
+}
+
+fn bundled_template_roots() -> Vec<PathBuf> {
+    let writable_root = writable_templates_path();
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for root in app_search_roots() {
+        let candidate = root.join("templates");
+        if writable_root.as_ref() == Some(&candidate) {
+            continue;
+        }
+        if candidate.is_dir() && seen.insert(candidate.clone()) {
+            roots.push(candidate);
+        }
+    }
+    roots
+}
+
+fn ensure_default_templates_installed() {
+    let Some(writable_root) = writable_templates_path() else {
+        return;
+    };
+    if directory_has_files(&writable_root) {
+        return;
+    }
+
+    let Some(default_root) = bundled_template_roots().into_iter().next() else {
+        return;
+    };
+
+    let _ = copy_path_recursively(&default_root, &writable_root);
+}
+
+fn directory_has_files(path: &Path) -> bool {
+    fs::read_dir(path)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some()
+}
+
+fn template_default_copy_name(tex_path: &Path) -> String {
+    tex_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("template.tex")
+        .to_owned()
+}
+
+fn normalize_template_copy_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut sanitized: String = trimmed
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => ch,
+        })
+        .collect();
+    if sanitized.is_empty() {
+        return None;
+    }
+    if !sanitized.to_ascii_lowercase().ends_with(".tex") {
+        sanitized.push_str(".tex");
+    }
+    Some(sanitized)
+}
+
+fn collect_template_entries(
+    templates_root: &Path,
+    dir: &Path,
+    seen: &mut HashSet<PathBuf>,
+    entries: &mut Vec<TemplateEntry>,
+) {
+    let Ok(children) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for child in children.flatten() {
+        let path = child.path();
+        if path.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("out"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            collect_template_entries(templates_root, &path, seen, entries);
+            continue;
+        }
+
+        let is_tex = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("tex"))
+            .unwrap_or(false);
+        if !is_tex {
+            continue;
+        }
+
+        let pdf_path = output_pdf_path(&path);
+        if !pdf_path.exists() || !seen.insert(path.clone()) {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(templates_root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        entries.push(TemplateEntry {
+            tex_path: path,
+            pdf_path,
+            label: relative,
+        });
+    }
 }
 
 fn read_git_status(working_directory: &Path) -> String {
@@ -3714,7 +4608,7 @@ fn is_escaped(bytes: &[u8], index: usize) -> bool {
     count % 2 == 1
 }
 
-fn analyze_tex(text: &str, cursor_line: Option<usize>) -> TexAnalysis {
+fn analyze_tex(text: &str, cursor_line: Option<usize>, settings: &AppSettings) -> TexAnalysis {
     let mut analysis = TexAnalysis {
         line_count: text.lines().count().max(1),
         char_count: text.chars().count(),
@@ -3829,7 +4723,7 @@ fn analyze_tex(text: &str, cursor_line: Option<usize>) -> TexAnalysis {
         });
     }
 
-    collect_spelling_diagnostics(text, cursor_line, &mut analysis.diagnostics);
+    collect_spelling_diagnostics(text, cursor_line, settings, &mut analysis.diagnostics);
     fill_error_diagnostic_ranges(text, &mut analysis.diagnostics);
     analysis
 }
@@ -3990,18 +4884,23 @@ fn collect_braces(
 fn collect_spelling_diagnostics(
     text: &str,
     cursor_line: Option<usize>,
+    settings: &AppSettings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    if !settings.spellcheck_enabled {
+        return;
+    }
+
     let tokens = collect_spelling_tokens(text);
     if tokens.is_empty() {
         return;
     }
 
-    let misspelled = if let Some(config) = hunspell_config() {
-        hunspell_misspellings(config, &tokens)
-            .or_else(|| fallback_dictionary_misspellings(&tokens))
+    let misspelled = if let Some(config) = resolved_hunspell_config(settings.preferred_dictionary.as_deref()) {
+        hunspell_misspellings(&config, &tokens)
+            .or_else(|| fallback_dictionary_misspellings(settings.preferred_dictionary.as_deref(), &tokens))
     } else {
-        fallback_dictionary_misspellings(&tokens)
+        fallback_dictionary_misspellings(settings.preferred_dictionary.as_deref(), &tokens)
     };
 
     let Some(misspelled) = misspelled else {
@@ -4220,7 +5119,16 @@ fn is_known_english_word(word: &str, dictionary: &HashSet<String>) -> bool {
         || dictionary.contains(&format!("{word}ing"))
 }
 
-fn fallback_dictionary_misspellings(tokens: &[(usize, usize, usize, String)]) -> Option<HashSet<String>> {
+fn fallback_dictionary_misspellings(
+    preferred_dictionary: Option<&str>,
+    tokens: &[(usize, usize, usize, String)],
+) -> Option<HashSet<String>> {
+    if preferred_dictionary
+        .map(|name| !name.starts_with("en_"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
     let dictionary = english_dictionary()?;
     Some(
         tokens
@@ -4294,31 +5202,108 @@ struct HunspellConfig {
     dictionary_dir: Option<String>,
 }
 
-fn hunspell_config() -> Option<&'static HunspellConfig> {
-    static CONFIG: OnceLock<Option<HunspellConfig>> = OnceLock::new();
-    CONFIG.get_or_init(load_hunspell_config).as_ref()
+fn available_hunspell_dictionaries() -> &'static [HunspellDictionary] {
+    static DICTIONARIES: OnceLock<Vec<HunspellDictionary>> = OnceLock::new();
+    DICTIONARIES.get_or_init(discover_hunspell_dictionaries).as_slice()
 }
 
-fn load_hunspell_config() -> Option<HunspellConfig> {
-    let command_path = resolve_command_path("hunspell")?;
-    let dictionary_path = known_hunspell_dictionary_paths()
-        .into_iter()
-        .find(|path| path.exists());
+fn discover_hunspell_dictionaries() -> Vec<HunspellDictionary> {
+    let mut seen = HashSet::new();
+    let mut dictionaries = Vec::new();
 
-    let dictionary_name = dictionary_path
-        .as_deref()
-        .and_then(Path::file_stem)
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("en_US")
-        .to_owned();
-    let dictionary_dir = dictionary_path
-        .as_deref()
-        .and_then(Path::parent)
+    for dir in known_hunspell_dictionary_directories() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("dic") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if seen.insert(name.to_owned()) {
+                dictionaries.push(HunspellDictionary {
+                    name: name.to_owned(),
+                    path,
+                });
+            }
+        }
+    }
+
+    dictionaries.sort_by(|a, b| a.name.cmp(&b.name));
+    dictionaries
+}
+
+fn known_hunspell_dictionary_directories() -> Vec<PathBuf> {
+    let mut dirs = bundled_hunspell_dictionary_directories();
+    dirs.extend([
+        PathBuf::from("/usr/share/hunspell"),
+        PathBuf::from("/usr/share/myspell"),
+        PathBuf::from(r"C:\Program Files\Hunspell\share\hunspell"),
+        PathBuf::from(r"C:\Program Files\Hunspell"),
+    ]);
+    dirs
+}
+
+fn bundled_hunspell_dictionary_directories() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for root in app_search_roots() {
+        dirs.push(root.clone());
+        dirs.push(root.join("dict"));
+        dirs.push(root.join("hunspell"));
+        dirs.push(root.join("hunspell").join("dict"));
+        dirs.push(root.join("dist-win64"));
+        dirs.push(root.join("hunspell").join("dist-win64"));
+        dirs.push(root.join("tools").join("hunspell"));
+        dirs.push(root.join("tools").join("hunspell").join("dict"));
+        dirs.push(root.join("tools").join("hunspell").join("dist-win64"));
+    }
+    dirs
+}
+
+fn legacy_hunspell_dictionary_paths(name: &str) -> Vec<PathBuf> {
+    known_hunspell_dictionary_directories()
+        .into_iter()
+        .map(|dir| dir.join(format!("{name}.dic")))
+        .collect()
+}
+
+fn dictionary_display_label(name: &str) -> String {
+    match name {
+        "Auto" => "Auto".to_owned(),
+        "en_US" => "English (US)".to_owned(),
+        "en_GB" => "English (UK)".to_owned(),
+        "ja_JP" => "Japanese".to_owned(),
+        "de_DE" => "German".to_owned(),
+        "fr_FR" => "French".to_owned(),
+        "es_ES" => "Spanish".to_owned(),
+        "it_IT" => "Italian".to_owned(),
+        "pt_BR" => "Portuguese (Brazil)".to_owned(),
+        "pt_PT" => "Portuguese (Portugal)".to_owned(),
+        _ => name.replace('_', "-"),
+    }
+}
+
+fn resolved_hunspell_config(preferred_dictionary: Option<&str>) -> Option<HunspellConfig> {
+    let command_path = resolve_command_path("hunspell")?;
+    let dictionary = preferred_dictionary
+        .and_then(|name| {
+            available_hunspell_dictionaries()
+                .iter()
+                .find(|dictionary| dictionary.name == name)
+        })
+        .or_else(|| available_hunspell_dictionaries().first())?;
+
+    let dictionary_dir = dictionary
+        .path
+        .parent()
         .map(|path| path.to_string_lossy().into_owned());
 
     Some(HunspellConfig {
         command_path,
-        dictionary_name,
+        dictionary_name: dictionary.name.clone(),
         dictionary_dir,
     })
 }
@@ -4341,36 +5326,13 @@ fn load_english_dictionary() -> Option<HashSet<String>> {
 }
 
 fn known_english_dictionary_paths() -> Vec<PathBuf> {
-    known_hunspell_dictionary_paths()
-}
-
-fn known_hunspell_dictionary_paths() -> Vec<PathBuf> {
-    let mut paths = bundled_hunspell_dictionary_paths();
-    paths.extend([
-        PathBuf::from("/usr/share/hunspell/en_US.dic"),
-        PathBuf::from("/usr/share/myspell/en_US.dic"),
-        PathBuf::from(r"C:\Program Files\Hunspell\share\hunspell\en_US.dic"),
-        PathBuf::from(r"C:\Program Files\Hunspell\en_US.dic"),
-    ]);
+    let mut paths: Vec<_> = available_hunspell_dictionaries()
+        .iter()
+        .filter(|dictionary| dictionary.name == "en_US")
+        .map(|dictionary| dictionary.path.clone())
+        .collect();
+    paths.extend(legacy_hunspell_dictionary_paths("en_US"));
     paths
-}
-
-fn bundled_hunspell_dictionary_paths() -> Vec<PathBuf> {
-    app_search_roots()
-        .into_iter()
-        .flat_map(|root| {
-            [
-                root.join("en_US.dic"),
-                root.join("dict").join("en_US.dic"),
-                root.join("hunspell").join("en_US.dic"),
-                root.join("hunspell").join("dict").join("en_US.dic"),
-                root.join("dist-win64").join("en_US.dic"),
-                root.join("hunspell").join("dist-win64").join("en_US.dic"),
-                root.join("tools").join("hunspell").join("en_US.dic"),
-                root.join("tools").join("hunspell").join("dist-win64").join("en_US.dic"),
-            ]
-        })
-        .collect()
 }
 
 fn app_search_roots() -> Vec<PathBuf> {
