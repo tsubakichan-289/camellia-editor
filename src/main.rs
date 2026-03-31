@@ -2479,7 +2479,7 @@ impl TexEditorApp {
                             .galley
                             .pos_from_cursor(&cursor_range.primary)
                             .translate(output.galley_pos.to_vec2());
-                        (cursor_rect.left_bottom(), start_char, end_char, completions)
+                        (cursor_rect, start_char, end_char, completions)
                     })
             });
 
@@ -2524,7 +2524,7 @@ impl TexEditorApp {
                 }
             }
 
-            if let Some((popup_pos, start_char, end_char, completions)) = popup_data {
+            if let Some((cursor_rect, start_char, end_char, completions)) = popup_data {
                 let completions: Vec<LspCompletionItem> = completions.to_vec();
                 let environment_context = completion_is_environment_context(&self.text, start_char);
                 if completions.is_empty() {
@@ -2558,9 +2558,11 @@ impl TexEditorApp {
                     }
                 }
 
+                let popup_pos =
+                    completion_popup_position(ctx, cursor_rect, completions.len());
                 egui::Area::new(egui::Id::new("completion_popup"))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(popup_pos + egui::vec2(0.0, 6.0))
+                    .fixed_pos(popup_pos)
                     .show(ctx, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
                             ui.set_min_width(260.0);
@@ -5649,6 +5651,30 @@ fn merge_adjacent_sections(
         merged.push(section);
     }
     merged
+}
+
+fn completion_popup_position(
+    ctx: &egui::Context,
+    cursor_rect: egui::Rect,
+    item_count: usize,
+) -> egui::Pos2 {
+    let row_height = 28.0;
+    let frame_padding = 18.0;
+    let popup_height = (item_count as f32 * row_height + frame_padding).min(300.0);
+    let gap = 6.0;
+    let content_rect = ctx.input(|i| i.screen_rect());
+    let below_y = cursor_rect.left_bottom().y + gap;
+    let above_y = cursor_rect.left_top().y - gap - popup_height;
+    let room_below = content_rect.bottom() - below_y;
+    let room_above = cursor_rect.left_top().y - content_rect.top();
+
+    let y = if room_below >= popup_height || room_below >= room_above {
+        below_y
+    } else {
+        above_y.max(content_rect.top() + 4.0)
+    };
+
+    egui::pos2(cursor_rect.left(), y)
 }
 
 fn char_to_byte_offsets(text: &str) -> Vec<usize> {
