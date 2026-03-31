@@ -3181,20 +3181,12 @@ fn discover_template_entries() -> Vec<TemplateEntry> {
 }
 
 fn template_root_candidates() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
     if let Some(candidate) = writable_templates_path() {
-        if candidate.is_dir() && seen.insert(candidate.clone()) {
-            roots.push(candidate);
+        if candidate.is_dir() {
+            return vec![candidate];
         }
     }
-    for root in app_search_roots() {
-        let candidate = root.join("templates");
-        if candidate.is_dir() && seen.insert(candidate.clone()) {
-            roots.push(candidate);
-        }
-    }
-    roots
+    bundled_template_roots()
 }
 
 fn primary_template_root() -> PathBuf {
