@@ -93,6 +93,10 @@ fn writable_templates_path() -> Option<PathBuf> {
     app_state_dir().map(|dir| dir.join("templates"))
 }
 
+fn default_templates_marker_path() -> Option<PathBuf> {
+    app_state_dir().map(|dir| dir.join("default-templates-installed.json"))
+}
+
 fn load_recent_directories() -> Vec<PathBuf> {
     let Some(path) = recent_directories_path() else {
         return Vec::new();
@@ -3215,9 +3219,25 @@ fn ensure_default_templates_installed() {
     let Some(writable_root) = writable_templates_path() else {
         return;
     };
-    for default_root in bundled_template_roots() {
+    let Some(marker_path) = default_templates_marker_path() else {
+        return;
+    };
+    if marker_path.exists() {
+        return;
+    }
+
+    let default_roots = bundled_template_roots();
+    if default_roots.is_empty() {
+        return;
+    }
+
+    for default_root in default_roots {
         copy_missing_template_files(&default_root, &writable_root);
     }
+    if let Some(parent) = marker_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(marker_path, "{\"installed\":true}\n");
 }
 
 fn copy_missing_template_files(source_root: &Path, destination_root: &Path) {
