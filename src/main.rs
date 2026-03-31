@@ -93,8 +93,8 @@ fn writable_templates_path() -> Option<PathBuf> {
     app_state_dir().map(|dir| dir.join("templates"))
 }
 
-fn default_templates_marker_path() -> Option<PathBuf> {
-    app_state_dir().map(|dir| dir.join("default-templates-installed.json"))
+fn deleted_templates_path() -> Option<PathBuf> {
+    app_state_dir().map(|dir| dir.join("deleted-default-templates.json"))
 }
 
 fn load_recent_directories() -> Vec<PathBuf> {
@@ -567,6 +567,8 @@ impl TexEditorApp {
 
     fn delete_template(&mut self, tex_path: &Path) {
         let pdf_path = output_pdf_path(tex_path);
+        remember_deleted_default_template(tex_path);
+        remember_deleted_default_template(&pdf_path);
         let tex_result = remove_path_recursively(tex_path);
         if let Err(err) = tex_result {
             self.status_message = format!("Template delete failed: {err}");
@@ -3215,32 +3217,82 @@ fn bundled_template_roots() -> Vec<PathBuf> {
     roots
 }
 
+fn remember_deleted_default_template(path: &Path) {
+    let relative = bundled_template_relative_path(path)
+        .or_else(|| writable_template_relative_path(path));
+    let Some(relative) = relative else {
+        return;
+    };
+
+    let mut deleted_entries = load_deleted_default_templates();
+    deleted_entries.insert(relative);
+    save_deleted_default_templates(&deleted_entries);
+}
+
+fn bundled_template_relative_path(path: &Path) -> Option<String> {
+    for root in bundled_template_roots() {
+        if let Ok(relative) = path.strip_prefix(&root) {
+            return Some(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    None
+}
+
+fn writable_template_relative_path(path: &Path) -> Option<String> {
+    let root = writable_templates_path()?;
+    let relative = path.strip_prefix(root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
 fn ensure_default_templates_installed() {
     let Some(writable_root) = writable_templates_path() else {
         return;
     };
-    let Some(marker_path) = default_templates_marker_path() else {
-        return;
-    };
-    if marker_path.exists() {
-        return;
-    }
-
+    let deleted_entries = load_deleted_default_templates();
     let default_roots = bundled_template_roots();
     if default_roots.is_empty() {
         return;
     }
 
     for default_root in default_roots {
-        copy_missing_template_files(&default_root, &writable_root);
+        copy_missing_template_files(&default_root, &writable_root, &deleted_entries);
     }
-    if let Some(parent) = marker_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(marker_path, "{\"installed\":true}\n");
 }
 
-fn copy_missing_template_files(source_root: &Path, destination_root: &Path) {
+fn load_deleted_default_templates() -> HashSet<String> {
+    let Some(path) = deleted_templates_path() else {
+        return HashSet::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    serde_json::from_str::<Vec<String>>(&text)
+        .map(|items| items.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn save_deleted_default_templates(entries: &HashSet<String>) {
+    let Some(path) = deleted_templates_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let mut items: Vec<_> = entries.iter().cloned().collect();
+    items.sort();
+    if let Ok(text) = serde_json::to_string_pretty(&items) {
+        let _ = fs::write(path, text);
+    }
+}
+
+fn copy_missing_template_files(
+    source_root: &Path,
+    destination_root: &Path,
+    deleted_entries: &HashSet<String>,
+) {
     let Ok(entries) = fs::read_dir(source_root) else {
         return;
     };
@@ -3252,13 +3304,14 @@ fn copy_missing_template_files(source_root: &Path, destination_root: &Path) {
             Err(_) => continue,
         };
         let destination_path = destination_root.join(relative);
+        let relative_key = relative.to_string_lossy().replace('\\', "/");
 
         if source_path.is_dir() {
-            copy_missing_template_files(&source_path, &destination_path);
+            copy_missing_template_files(&source_path, &destination_path, deleted_entries);
             continue;
         }
 
-        if destination_path.exists() {
+        if destination_path.exists() || deleted_entries.contains(&relative_key) {
             continue;
         }
 
