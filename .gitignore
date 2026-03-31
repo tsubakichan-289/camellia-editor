@@ -1,2 +1,6 @@
 /target
 *.TMP
+*.tmp
+*~
+camellia-editor/
+installer-dist/

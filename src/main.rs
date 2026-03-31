@@ -1,7 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::fs;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::BufRead;
 use std::io::Write;
@@ -62,6 +62,72 @@ fn load_app_icon() -> IconData {
     }
 }
 
+fn app_state_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return Some(PathBuf::from(appdata).join("camellia-editor"));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(config_home).join("camellia-editor"));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(PathBuf::from(home).join(".config").join("camellia-editor"));
+        }
+    }
+    None
+}
+
+fn recent_directories_path() -> Option<PathBuf> {
+    app_state_dir().map(|dir| dir.join("recent-directories.json"))
+}
+
+fn load_recent_directories() -> Vec<PathBuf> {
+    let Some(path) = recent_directories_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(items) = serde_json::from_str::<Vec<String>>(&text) else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn save_recent_directories(paths: &[PathBuf]) {
+    let Some(path) = recent_directories_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let serialized: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    if let Ok(json) = serde_json::to_string(&serialized) {
+        let _ = fs::write(path, json);
+    }
+}
+
+fn launch_target_path() -> Option<PathBuf> {
+    std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+}
+
 fn configure_command(command: Command) -> Command {
     #[cfg(target_os = "windows")]
     {
@@ -78,7 +144,11 @@ fn configure_command(command: Command) -> Command {
 struct TexEditorApp {
     text: String,
     current_path: Option<PathBuf>,
+    file_buffers: HashMap<PathBuf, EditorBuffer>,
     opened_directory: Option<PathBuf>,
+    recent_directories: Vec<PathBuf>,
+    file_tree: FileNode,
+    file_tree_dirty: bool,
     active_left_tab: LeftPanelTab,
     active_center_tab: CenterPanelTab,
     git_status: String,
@@ -102,6 +172,7 @@ struct TexEditorApp {
     pdf_preview_textures: Vec<TextureHandle>,
     pdf_preview_render_error: Option<String>,
     pdf_preview_render_key: Option<String>,
+    selected_pdf_path: Option<PathBuf>,
     texlab_sender: Option<Sender<TexlabCommand>>,
     texlab_receiver: Option<Receiver<TexlabEvent>>,
     texlab_status: Option<String>,
@@ -116,12 +187,21 @@ struct TexEditorApp {
     file_new_name: String,
     git_commit_message: String,
     external_tool_statuses: Vec<ExternalToolStatus>,
+    confirm_close_requested: bool,
+    allow_immediate_close: bool,
 }
 
 #[derive(Clone)]
 struct FileClipboard {
     path: PathBuf,
     mode: FileClipboardMode,
+}
+
+#[derive(Clone)]
+struct FileNode {
+    path: PathBuf,
+    is_dir: bool,
+    children: Vec<FileNode>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -149,6 +229,44 @@ struct ExternalToolStatus {
 struct LspCompletionItem {
     label: String,
     insert_text: String,
+    kind: Option<LspCompletionKind>,
+    detail: Option<String>,
+    deprecated: bool,
+}
+
+#[derive(Clone)]
+struct EditorBuffer {
+    text: String,
+    last_cursor_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LspCompletionKind {
+    Text,
+    Method,
+    Function,
+    Constructor,
+    Field,
+    Variable,
+    Class,
+    Interface,
+    Module,
+    Property,
+    Unit,
+    Value,
+    Enum,
+    Keyword,
+    Snippet,
+    Color,
+    File,
+    Reference,
+    Folder,
+    EnumMember,
+    Constant,
+    Struct,
+    Event,
+    Operator,
+    TypeParameter,
 }
 
 enum TexlabCommand {
@@ -174,10 +292,132 @@ enum TexlabEvent {
 }
 
 impl TexEditorApp {
+    fn text_differs_from_saved(&self, path: Option<&Path>, text: &str) -> bool {
+        match path {
+            Some(path) => fs::read_to_string(path)
+                .map(|saved| saved != text)
+                .unwrap_or(!text.trim().is_empty()),
+            None => !text.trim().is_empty(),
+        }
+    }
+
+    fn recompute_current_dirty(&mut self) {
+        self.dirty = self.text_differs_from_saved(self.current_path.as_deref(), &self.text);
+    }
+
+    fn store_current_buffer(&mut self) {
+        if let Some(path) = self.current_path.clone() {
+            self.file_buffers.insert(
+                path,
+                EditorBuffer {
+                    text: self.text.clone(),
+                    last_cursor_index: self.last_cursor_index,
+                },
+            );
+        }
+    }
+
+    fn file_has_unsaved_changes(&self, path: &Path) -> bool {
+        if self.current_path.as_deref() == Some(path) {
+            return self.text_differs_from_saved(Some(path), &self.text);
+        }
+        self.file_buffers
+            .get(path)
+            .map(|buffer| self.text_differs_from_saved(Some(path), &buffer.text))
+            .unwrap_or(false)
+    }
+
+    fn has_unsaved_workspace_changes(&self) -> bool {
+        let Some(root) = self.opened_directory.as_deref() else {
+            return false;
+        };
+
+        (self.current_path.as_deref().map(|path| path.starts_with(root)).unwrap_or(false)
+            && self.text_differs_from_saved(self.current_path.as_deref(), &self.text))
+            || self
+                .file_buffers
+                .iter()
+                .any(|(path, buffer)| {
+                    path.starts_with(root) && self.text_differs_from_saved(Some(path), &buffer.text)
+                })
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.allow_immediate_close {
+            return;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.has_unsaved_workspace_changes() {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.confirm_close_requested = true;
+        }
+    }
+
+    fn show_close_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_close_requested {
+            return;
+        }
+
+        egui::Window::new("Unsaved Changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("Save changes before closing?");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.save_document();
+                        if !self.has_unsaved_workspace_changes() {
+                            self.confirm_close_requested = false;
+                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                        }
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        self.confirm_close_requested = false;
+                        self.allow_immediate_close = true;
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_close_requested = false;
+                    }
+                });
+            });
+    }
+
+    fn request_open_document_at_path(&mut self, path: PathBuf) {
+        self.open_document_at_path(path);
+    }
+
+    fn request_open_pdf_at_path(&mut self, path: PathBuf) {
+        self.open_pdf_at_path(path);
+    }
+
+    fn register_recent_directory(&mut self, path: &Path) {
+        self.recent_directories.retain(|item| item != path);
+        self.recent_directories.insert(0, path.to_path_buf());
+        self.recent_directories.truncate(8);
+        save_recent_directories(&self.recent_directories);
+    }
+
+    fn set_opened_directory(&mut self, path: PathBuf) {
+        self.register_recent_directory(&path);
+        self.opened_directory = Some(path.clone());
+        self.selected_tree_path = Some(path.clone());
+        self.file_tree = build_file_node(&path);
+        self.file_tree_dirty = false;
+        self.current_path = None;
+        self.selected_pdf_path = None;
+        self.active_left_tab = LeftPanelTab::File;
+        self.refresh_git_status();
+        self.refresh_external_tool_statuses();
+        self.status_message = format!("Opened directory {}", path.display());
+    }
+
     fn new_document(&mut self) {
+        self.store_current_buffer();
         self.text.clear();
         self.current_path = None;
-        self.dirty = false;
+        self.recompute_current_dirty();
         self.status_message = "New TeX document".to_owned();
         self.refresh_analysis();
         self.refresh_git_status();
@@ -189,6 +429,17 @@ impl TexEditorApp {
         self.math_preview_edit_deadline = None;
         self.last_cursor_index = None;
         self.pdf_preview_render_key = None;
+        self.selected_pdf_path = None;
+    }
+
+    fn refresh_file_tree(&mut self) {
+        let root = self.working_directory();
+        self.file_tree = build_file_node(&root);
+        self.file_tree_dirty = false;
+    }
+
+    fn mark_file_tree_dirty(&mut self) {
+        self.file_tree_dirty = true;
     }
 
     fn open_directory(&mut self) {
@@ -199,13 +450,7 @@ impl TexEditorApp {
             return;
         };
 
-        self.opened_directory = Some(path.clone());
-        self.selected_tree_path = Some(path.clone());
-        self.current_path = None;
-        self.active_left_tab = LeftPanelTab::File;
-        self.refresh_git_status();
-        self.refresh_external_tool_statuses();
-        self.status_message = format!("Opened directory {}", path.display());
+        self.set_opened_directory(path);
     }
 
     fn save_document(&mut self) {
@@ -234,11 +479,23 @@ impl TexEditorApp {
         match fs::write(path, &self.text) {
             Ok(()) => {
                 if self.opened_directory.is_none() {
+                    if let Some(parent) = path.parent() {
+                        self.register_recent_directory(parent);
+                    }
                     self.opened_directory = path.parent().map(Path::to_path_buf);
                 }
                 self.current_path = Some(path.to_path_buf());
                 self.selected_tree_path = Some(path.to_path_buf());
                 self.dirty = false;
+                self.file_buffers.insert(
+                    path.to_path_buf(),
+                    EditorBuffer {
+                        text: self.text.clone(),
+                        last_cursor_index: self.last_cursor_index,
+                    },
+                );
+                self.mark_file_tree_dirty();
+                self.selected_pdf_path = None;
                 self.refresh_git_status();
                 self.status_message = format!("Saved {}", display_name(path));
             }
@@ -342,7 +599,7 @@ impl TexEditorApp {
             replace_end_char,
             &replacement,
         );
-        self.dirty = true;
+        self.recompute_current_dirty();
         self.status_message = format!("Completed {}", item);
         self.refresh_analysis();
         self.sync_texlab_document();
@@ -400,35 +657,72 @@ impl TexEditorApp {
     }
 
     fn open_document_at_path(&mut self, path: PathBuf) {
-        match fs::read_to_string(&path) {
-            Ok(text) => {
-                self.text = text;
-                if self.opened_directory.is_none() {
-                    self.opened_directory = path.parent().map(Path::to_path_buf);
+        self.store_current_buffer();
+
+        let buffer = if let Some(buffer) = self.file_buffers.get(&path).cloned() {
+            buffer
+        } else {
+            match fs::read_to_string(&path) {
+                Ok(text) => EditorBuffer {
+                    text,
+                    last_cursor_index: None,
+                },
+                Err(err) => {
+                    self.status_message = format!("Open failed: {err}");
+                    return;
                 }
-                self.current_path = Some(path.clone());
-                self.selected_tree_path = Some(path.clone());
-                self.dirty = false;
-                self.status_message = format!("Opened {}", display_name(&path));
-                self.refresh_analysis();
-                self.refresh_git_status();
-                self.active_math_preview = math_preview_at_cursor(&self.text, 0);
-                self.sync_texlab_document();
-                self.math_preview_requested_key = None;
-                self.math_preview_receiver = None;
-                self.math_preview_running = false;
-                self.math_preview_edit_deadline = None;
-                self.last_cursor_index = None;
-                self.pdf_preview_render_key = None;
             }
-            Err(err) => {
-                self.status_message = format!("Open failed: {err}");
+        };
+
+        self.text = buffer.text.clone();
+        self.dirty = self.text_differs_from_saved(Some(&path), &self.text);
+        self.last_cursor_index = buffer.last_cursor_index;
+        self.file_buffers.insert(path.clone(), buffer);
+        if self.opened_directory.is_none() {
+            if let Some(parent) = path.parent() {
+                self.register_recent_directory(parent);
             }
+            self.opened_directory = path.parent().map(Path::to_path_buf);
+        }
+        self.current_path = Some(path.clone());
+        self.selected_tree_path = Some(path.clone());
+        self.selected_pdf_path = None;
+        self.status_message = format!("Opened {}", display_name(&path));
+        self.refresh_analysis();
+        self.refresh_git_status();
+        self.active_math_preview = math_preview_at_cursor(&self.text, self.last_cursor_index.unwrap_or(0));
+        self.sync_texlab_document();
+        self.math_preview_requested_key = None;
+        self.math_preview_receiver = None;
+        self.math_preview_running = false;
+        self.math_preview_edit_deadline = None;
+        self.pdf_preview_render_key = None;
+    }
+
+    fn open_pdf_at_path(&mut self, path: PathBuf) {
+        if let Some(parent) = path.parent() {
+            if self.opened_directory.is_none() {
+                self.register_recent_directory(parent);
+                self.opened_directory = Some(parent.to_path_buf());
+            }
+        }
+        self.selected_tree_path = Some(path.clone());
+        self.selected_pdf_path = Some(path.clone());
+        self.active_center_tab = CenterPanelTab::Pdf;
+        self.pdf_preview_render_key = None;
+        self.pdf_preview_render_error = None;
+
+        if let Some(tex_path) = corresponding_tex_path(&path) {
+            self.open_document_at_path(tex_path);
+            self.selected_pdf_path = Some(path.clone());
+            self.active_center_tab = CenterPanelTab::Pdf;
+        } else {
+            self.status_message = format!("Opened {}", display_name(&path));
         }
     }
 
     fn showing_directory_placeholder(&self) -> bool {
-        self.current_path.is_none() && !self.dirty && self.text.trim().is_empty()
+        self.current_path.is_none() && !self.has_unsaved_workspace_changes() && self.text.trim().is_empty()
     }
 
     fn build_document(&mut self) {
@@ -450,7 +744,10 @@ impl TexEditorApp {
             }
         }
 
-        let project_root = self.working_directory();
+        let project_root = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.working_directory());
 
         let (tool, args) = if let Some(tool) = resolve_command_path("latexmk") {
             match latexmk_build_args(&path, &project_root) {
@@ -530,7 +827,7 @@ impl TexEditorApp {
             .map(display_name)
             .unwrap_or_else(|| "untitled.tex".to_owned());
 
-        if self.dirty {
+        if self.has_unsaved_workspace_changes() {
             format!("camellia-editor - {base} *")
         } else {
             format!("camellia-editor - {base}")
@@ -548,6 +845,17 @@ impl TexEditorApp {
                 if ui.button(folder_button).clicked() {
                     self.open_directory();
                 }
+                ui.add_enabled_ui(!self.recent_directories.is_empty(), |ui| {
+                    ui.menu_button("Recent Folders", |ui| {
+                        let recent_directories = self.recent_directories.clone();
+                        for path in recent_directories {
+                            if ui.button(path.display().to_string()).clicked() {
+                                self.set_opened_directory(path);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
                 if ui.button("Refresh Tools").clicked() {
                     self.refresh_external_tool_statuses();
                 }
@@ -576,6 +884,13 @@ impl TexEditorApp {
                         .map(display_name)
                         .unwrap_or_else(|| "No file selected".to_owned()),
                 );
+                ui.separator();
+                let (save_text, save_color) = if self.has_unsaved_workspace_changes() {
+                    ("unsaved", Color32::from_rgb(220, 170, 60))
+                } else {
+                    ("saved", Color32::from_rgb(90, 190, 120))
+                };
+                ui.label(RichText::new(save_text).color(save_color).strong());
             });
         });
     }
@@ -735,9 +1050,10 @@ impl TexEditorApp {
     }
 
     fn sync_pdf_preview_render(&mut self, ctx: &egui::Context) {
-        let Some(pdf_path) =
-            current_pdf_preview_path(self.current_path.as_deref(), &self.working_directory())
-        else {
+        let Some(pdf_path) = current_pdf_preview_path(
+            self.current_path.as_deref(),
+            self.selected_pdf_path.as_deref(),
+        ) else {
             self.pdf_preview_textures.clear();
             self.pdf_preview_render_error = None;
             self.pdf_preview_render_key = None;
@@ -802,7 +1118,7 @@ impl TexEditorApp {
             });
 
         if let Some(path) = selected_file {
-            self.open_document_at_path(path);
+            self.request_open_document_at_path(path);
         }
         if let Some(action) = tree_action {
             self.handle_tree_action(action);
@@ -820,56 +1136,49 @@ impl TexEditorApp {
             return;
         }
 
+        if self.file_tree_dirty {
+            self.refresh_file_tree();
+        }
+
         let working_directory = self.working_directory();
-        ui.label(
-            RichText::new(working_directory.display().to_string())
-                .monospace()
-                .small(),
-        );
+        ui.horizontal(|ui| {
+            let root_response = ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(format!("📁 {}", working_directory.display()))
+                            .strong()
+                            .monospace(),
+                    )
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_text("Workspace root");
+            if root_response.clicked() {
+                self.selected_tree_path = Some(working_directory.clone());
+            }
+            root_response.context_menu(|ui| {
+                show_tree_context_menu(
+                    ui,
+                    &working_directory,
+                    &mut self.file_new_name,
+                    self.file_clipboard.is_some(),
+                    tree_action,
+                    true,
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Refresh").clicked() {
+                    self.refresh_file_tree();
+                    self.status_message = "File tree refreshed".to_owned();
+                }
+            });
+        });
         ui.separator();
 
         ScrollArea::vertical()
             .id_salt("workspace_tree_scroll")
             .show(ui, |ui| {
-                if let Some(root) = &self.opened_directory {
-                    let outcome = show_directory_tree(
-                        ui,
-                        root,
-                        self.current_path.as_deref(),
-                        self.selected_tree_path.as_deref(),
-                        &mut self.file_new_name,
-                        self.file_clipboard.is_some(),
-                    );
-                    if let Some(path) = outcome.open_file {
-                        *selected_file = Some(path);
-                    }
-                    if let Some(path) = outcome.selected_path {
-                        self.selected_tree_path = Some(path);
-                    }
-                    if let Some(action) = outcome.action {
-                        *tree_action = Some(action);
-                    }
-                }
-
-                let target_dir = self
-                    .selected_tree_path
-                    .as_deref()
-                    .map(selected_path_target_dir)
-                    .unwrap_or_else(|| working_directory.clone());
-                let blank_response = ui.allocate_rect(
-                    ui.available_rect_before_wrap(),
-                    egui::Sense::click(),
-                );
-                blank_response.context_menu(|ui| {
-                    show_tree_context_menu(
-                        ui,
-                        &target_dir,
-                        &mut self.file_new_name,
-                        self.file_clipboard.is_some(),
-                        tree_action,
-                        true,
-                    );
-                });
+                let tree = self.file_tree.clone();
+                self.render_file_node(ui, &tree, selected_file, tree_action);
             });
     }
 
@@ -897,6 +1206,119 @@ impl TexEditorApp {
         self.refresh_git_status();
     }
 
+    fn render_file_node(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &FileNode,
+        selected_file: &mut Option<PathBuf>,
+        tree_action: &mut Option<TreeAction>,
+    ) {
+        if node.is_dir {
+            let header = egui::CollapsingHeader::new(
+                RichText::new(format!("{} {}", tree_item_icon(&node.path, true), display_name(&node.path)))
+                    .strong(),
+            )
+            .id_salt(&node.path)
+            .default_open(self.opened_directory.as_deref() == Some(node.path.as_path()));
+
+            let header_output = header.show(ui, |ui| {
+                for child in &node.children {
+                    self.render_file_node(ui, child, selected_file, tree_action);
+                }
+            });
+
+            let response = header_output.header_response;
+            if response.clicked() {
+                self.selected_tree_path = Some(node.path.clone());
+            }
+            response.context_menu(|ui| {
+                show_tree_context_menu(
+                    ui,
+                    &node.path,
+                    &mut self.file_new_name,
+                    self.file_clipboard.is_some(),
+                    tree_action,
+                    true,
+                );
+                if ui.button("copy").clicked() {
+                    *tree_action = Some(TreeAction::Copy(node.path.clone()));
+                    ui.close_menu();
+                }
+                if ui.button("cut").clicked() {
+                    *tree_action = Some(TreeAction::Cut(node.path.clone()));
+                    ui.close_menu();
+                }
+                if ui.button("delete").clicked() {
+                    *tree_action = Some(TreeAction::Delete(node.path.clone()));
+                    ui.close_menu();
+                }
+            });
+        } else {
+            let is_current = self.current_path.as_deref() == Some(node.path.as_path());
+            let is_selected = self.selected_tree_path.as_deref() == Some(node.path.as_path());
+            let is_unsaved = self.file_has_unsaved_changes(&node.path);
+            let file_name = display_name(&node.path);
+            let label_text = if is_unsaved {
+                format!("{} {} •", tree_item_icon(&node.path, false), file_name)
+            } else {
+                format!("{} {}", tree_item_icon(&node.path, false), file_name)
+            };
+            let label = if is_current {
+                RichText::new(label_text)
+                    .strong()
+                    .color(if is_unsaved {
+                        Color32::from_rgb(255, 196, 122)
+                    } else {
+                        ui.visuals().strong_text_color()
+                    })
+            } else {
+                RichText::new(label_text).color(if is_unsaved {
+                    Color32::from_rgb(255, 196, 122)
+                } else {
+                    ui.visuals().text_color()
+                })
+            };
+            let response = ui.selectable_label(is_current || is_selected, label);
+            if response.clicked() {
+                self.selected_tree_path = Some(node.path.clone());
+                if node
+                    .path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+                    .unwrap_or(false)
+                {
+                    self.request_open_pdf_at_path(node.path.clone());
+                } else if is_editor_text_path(&node.path) {
+                    *selected_file = Some(node.path.clone());
+                }
+            }
+            response.context_menu(|ui| {
+                let parent = node
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| node.path.clone());
+                if ui.button("paste").clicked() {
+                    *tree_action = Some(TreeAction::Paste(parent.clone()));
+                    ui.close_menu();
+                }
+                if ui.button("copy").clicked() {
+                    *tree_action = Some(TreeAction::Copy(node.path.clone()));
+                    ui.close_menu();
+                }
+                if ui.button("cut").clicked() {
+                    *tree_action = Some(TreeAction::Cut(node.path.clone()));
+                    ui.close_menu();
+                }
+                if ui.button("delete").clicked() {
+                    *tree_action = Some(TreeAction::Delete(node.path.clone()));
+                    ui.close_menu();
+                }
+            });
+        }
+    }
+
     fn create_tree_entry(&mut self, dir: &Path, is_dir: bool) {
         let name = self.file_new_name.trim();
         if name.is_empty() {
@@ -912,6 +1334,7 @@ impl TexEditorApp {
         match result {
             Ok(()) => {
                 self.selected_tree_path = Some(path.clone());
+                self.mark_file_tree_dirty();
                 self.status_message = format!(
                     "{} {}",
                     if is_dir { "Created folder" } else { "Created file" },
@@ -946,6 +1369,7 @@ impl TexEditorApp {
             Ok(()) => {
                 self.status_message = format!("Pasted {}", display_name(&destination));
                 self.selected_tree_path = Some(destination.clone());
+                self.mark_file_tree_dirty();
                 if clipboard.mode == FileClipboardMode::Cut {
                     self.file_clipboard = None;
                     if self.current_path.as_deref() == Some(clipboard.path.as_path()) {
@@ -968,6 +1392,7 @@ impl TexEditorApp {
                 if self.selected_tree_path.as_deref() == Some(path) {
                     self.selected_tree_path = None;
                 }
+                self.mark_file_tree_dirty();
                 self.status_message = format!("Deleted {}", display_name(path));
             }
             Err(err) => {
@@ -1247,6 +1672,15 @@ impl TexEditorApp {
                 ui.heading("Editor");
                 ui.separator();
                 ui.small("Ctrl+S / Ctrl+B");
+                if self
+                    .current_path
+                    .as_deref()
+                    .map(is_read_only_editor_path)
+                    .unwrap_or(false)
+                {
+                    ui.separator();
+                    ui.label(RichText::new("read-only").italics().color(Color32::from_rgb(180, 180, 180)));
+                }
             });
             ui.add_space(6.0);
 
@@ -1335,24 +1769,42 @@ impl TexEditorApp {
                 + 16.0;
             let pending_scroll_target = self.pending_scroll_jump;
 
+            let read_only = self
+                .current_path
+                .as_deref()
+                .map(is_read_only_editor_path)
+                .unwrap_or(false);
             let scroll_output = ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let (gutter_rect, _) = ui.allocate_exact_size(
+                        let (gutter_slot_rect, _) = ui.allocate_exact_size(
                             egui::vec2(gutter_width, ui.available_height()),
                             egui::Sense::hover(),
                         );
-                        let output = TextEdit::multiline(&mut self.text)
-                            .id_source("main_tex_editor")
-                            .font(egui::TextStyle::Monospace)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(30)
-                            .lock_focus(true)
-                            .hint_text("% Start writing LaTeX here")
-                            .layouter(&mut layouter)
-                            .show(ui);
+                        let output = if read_only {
+                            let mut display_text = self.text.clone();
+                            TextEdit::multiline(&mut display_text)
+                                .id_source("main_tex_editor")
+                                .font(egui::TextStyle::Monospace)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(30)
+                                .lock_focus(true)
+                                .layouter(&mut layouter)
+                                .show(ui)
+                        } else {
+                            TextEdit::multiline(&mut self.text)
+                                .id_source("main_tex_editor")
+                                .font(egui::TextStyle::Monospace)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(30)
+                                .lock_focus(true)
+                                .hint_text("% Start writing LaTeX here")
+                                .layouter(&mut layouter)
+                                .show(ui)
+                        };
                         if let Some(target) = pending_scroll_target {
                             let cursor_rect = output
                                 .galley
@@ -1361,6 +1813,10 @@ impl TexEditorApp {
                                 .expand2(egui::vec2(24.0, 36.0));
                             ui.scroll_to_rect(cursor_rect, Some(Align::Center));
                         }
+                        let gutter_rect = egui::Rect::from_min_size(
+                            egui::pos2(gutter_slot_rect.min.x, output.response.rect.min.y),
+                            egui::vec2(gutter_width, output.response.rect.height()),
+                        );
                         paint_line_number_gutter(ui, gutter_rect, &output, self.analysis.line_count);
                         output
                     })
@@ -1378,8 +1834,8 @@ impl TexEditorApp {
                     })
             });
 
-            if output.response.changed() {
-                self.dirty = true;
+            if !read_only && output.response.changed() {
+                self.recompute_current_dirty();
                 self.status_message = "Editing TeX".to_owned();
                 self.refresh_analysis();
                 self.sync_texlab_document();
@@ -1420,8 +1876,8 @@ impl TexEditorApp {
             }
 
             if let Some((popup_pos, start_char, end_char, completions)) = popup_data {
-                let completions: Vec<LspCompletionItem> =
-                    completions.iter().take(8).cloned().collect();
+                let completions: Vec<LspCompletionItem> = completions.to_vec();
+                let environment_context = completion_is_environment_context(&self.text, start_char);
                 if completions.is_empty() {
                     self.completion_selected_index = 0;
                     return;
@@ -1458,23 +1914,82 @@ impl TexEditorApp {
                     .fixed_pos(popup_pos + egui::vec2(0.0, 6.0))
                     .show(ctx, |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(240.0);
-                            for (index, item) in completions.iter().enumerate() {
-                                if ui
-                                    .selectable_label(
-                                        index == self.completion_selected_index,
-                                        &item.label,
-                                    )
-                                    .clicked()
-                                {
-                                    self.completion_selected_index = index;
-                                    self.apply_completion(
-                                        start_char,
-                                        end_char,
-                                        &item.insert_text,
-                                    );
-                                }
-                            }
+                            ui.set_min_width(260.0);
+                            ui.set_max_width(320.0);
+                            ScrollArea::vertical()
+                                .id_salt("completion_popup_scroll")
+                                .max_height(300.0)
+                                .show(ui, |ui| {
+                                    for (index, item) in completions.iter().enumerate() {
+                                        let selected = index == self.completion_selected_index;
+                                        let (kind_label, kind_color) =
+                                            completion_kind_badge(item, environment_context);
+                                        let mut clicked = false;
+                                        egui::Frame::NONE
+                                            .fill(if selected {
+                                                Color32::from_rgb(40, 52, 74)
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            })
+                                            .corner_radius(6.0)
+                                            .inner_margin(egui::Margin::symmetric(8, 3))
+                                            .show(ui, |ui| {
+                                                let response = ui
+                                                    .horizontal(|ui| {
+                                                        ui.label(
+                                                            RichText::new(format!(" {} ", kind_label))
+                                                                .monospace()
+                                                                .small()
+                                                                .color(Color32::WHITE)
+                                                                .background_color(kind_color),
+                                                        );
+                                                        let label = if item.deprecated {
+                                                            RichText::new(&item.label)
+                                                                .strikethrough()
+                                                                .color(Color32::from_rgb(170, 170, 170))
+                                                        } else {
+                                                            RichText::new(&item.label)
+                                                                .strong()
+                                                                .color(completion_label_color(
+                                                                    item,
+                                                                    environment_context,
+                                                                ))
+                                                        };
+                                                        ui.label(label);
+                                                        ui.with_layout(
+                                                            Layout::right_to_left(Align::Center),
+                                                            |ui| {
+                                                                if let Some(detail) =
+                                                                    completion_detail_preview(item)
+                                                                {
+                                                                    ui.label(
+                                                                        RichText::new(detail)
+                                                                            .small()
+                                                                            .monospace()
+                                                                            .color(Color32::from_rgb(
+                                                                                138, 160, 183,
+                                                                            )),
+                                                                    );
+                                                                }
+                                                            },
+                                                        );
+                                                    })
+                                                    .response;
+                                                if selected {
+                                                    ui.scroll_to_rect(response.rect, Some(Align::Center));
+                                                }
+                                                clicked = response.clicked();
+                                            });
+                                        if clicked {
+                                            self.completion_selected_index = index;
+                                            self.apply_completion(
+                                                start_char,
+                                                end_char,
+                                                &item.insert_text,
+                                            );
+                                        }
+                                    }
+                                });
                         });
                     });
             } else {
@@ -1494,6 +2009,13 @@ impl TexEditorApp {
                         ui.separator();
                         ui.spinner();
                     }
+                    ui.separator();
+                    let (save_text, save_color) = if self.has_unsaved_workspace_changes() {
+                        ("unsaved", Color32::from_rgb(220, 170, 60))
+                    } else {
+                        ("saved", Color32::from_rgb(90, 190, 120))
+                    };
+                    ui.label(RichText::new(save_text).color(save_color).strong());
                     ui.separator();
                     ui.label(format!("{} lines", self.analysis.line_count));
                     ui.separator();
@@ -1542,10 +2064,14 @@ impl Default for TexEditorApp {
             text,
             current_path: None,
             opened_directory: None,
+            recent_directories: load_recent_directories(),
+            file_tree: build_file_node(Path::new(".")),
+            file_tree_dirty: false,
             active_left_tab: LeftPanelTab::Tex,
             active_center_tab: CenterPanelTab::Tex,
             git_status: "Open a directory to inspect git status.\n".to_owned(),
             dirty: false,
+            file_buffers: HashMap::new(),
             status_message: "TeX editor ready".to_owned(),
             build_log: "Build output will appear here.\n".to_owned(),
             build_tool: None,
@@ -1565,6 +2091,7 @@ impl Default for TexEditorApp {
             pdf_preview_textures: Vec::new(),
             pdf_preview_render_error: None,
             pdf_preview_render_key: None,
+            selected_pdf_path: None,
             texlab_sender,
             texlab_receiver,
             texlab_status,
@@ -1579,14 +2106,39 @@ impl Default for TexEditorApp {
             file_new_name: String::new(),
             git_commit_message: "Update from camellia-editor".to_owned(),
             external_tool_statuses: Vec::new(),
+            confirm_close_requested: false,
+            allow_immediate_close: false,
         };
         app.refresh_external_tool_statuses();
+        if let Some(target) = launch_target_path() {
+            if target.is_dir() {
+                app.set_opened_directory(target);
+            } else if target.is_file() {
+                if let Some(parent) = target.parent() {
+                    app.register_recent_directory(parent);
+                    app.opened_directory = Some(parent.to_path_buf());
+                    app.file_tree = build_file_node(parent);
+                    app.file_tree_dirty = false;
+                }
+                if target
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+                    .unwrap_or(false)
+                {
+                    app.open_pdf_at_path(target);
+                } else {
+                    app.open_document_at_path(target);
+                }
+            }
+        }
         app
     }
 }
 
 impl App for TexEditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        self.handle_close_request(ctx);
         self.handle_shortcuts(ctx);
         self.poll_build_status();
         self.poll_math_preview_status(ctx);
@@ -1600,6 +2152,7 @@ impl App for TexEditorApp {
         self.show_inspector_panel(ctx);
         self.show_status_bar(ctx);
         self.show_editor(ctx);
+        self.show_close_confirm_dialog(ctx);
     }
 }
 
@@ -1739,7 +2292,7 @@ fn run_build_command(
             if output.status.success() {
                 BuildOutcome {
                     success: true,
-                    status_message: format!("Build succeeded: {}", output_pdf_path(&path, &project_root).display()),
+                    status_message: format!("Build succeeded: {}", output_pdf_path(&path).display()),
                     log,
                 }
             } else {
@@ -1782,8 +2335,9 @@ fn file_name_for_build(path: &Path) -> String {
         .to_owned()
 }
 
-fn output_pdf_path(path: &Path, project_root: &Path) -> PathBuf {
-    project_root
+fn output_pdf_path(path: &Path) -> PathBuf {
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
         .join("out")
         .join(
             path.file_name()
@@ -1793,15 +2347,23 @@ fn output_pdf_path(path: &Path, project_root: &Path) -> PathBuf {
         .with_extension("pdf")
 }
 
-fn current_pdf_preview_path(current_path: Option<&Path>, project_root: &Path) -> Option<PathBuf> {
+fn current_pdf_preview_path(current_path: Option<&Path>, selected_pdf_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(pdf_path) = selected_pdf_path {
+        return pdf_path.exists().then(|| pdf_path.to_path_buf());
+    }
     let path = current_path?;
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     if extension != "tex" {
         return None;
     }
 
-    let pdf_path = output_pdf_path(path, project_root);
+    let pdf_path = output_pdf_path(path);
     pdf_path.exists().then_some(pdf_path)
+}
+
+fn corresponding_tex_path(pdf_path: &Path) -> Option<PathBuf> {
+    let candidate = pdf_path.with_extension("tex");
+    candidate.exists().then_some(candidate)
 }
 
 fn pdf_render_cache_key(pdf_path: &Path) -> String {
@@ -2615,9 +3177,57 @@ fn parse_lsp_completion_item(item: &Value) -> Option<LspCompletionItem> {
         .or_else(|| item.get("insertText").and_then(Value::as_str))
         .map(decode_lsp_snippet)
         .unwrap_or_else(|| label.clone());
+    let kind = item
+        .get("kind")
+        .and_then(Value::as_u64)
+        .and_then(parse_completion_kind);
+    let detail = item
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+    let deprecated = item
+        .get("deprecated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Some(LspCompletionItem {
         label,
         insert_text,
+        kind,
+        detail,
+        deprecated,
+    })
+}
+
+fn parse_completion_kind(kind: u64) -> Option<LspCompletionKind> {
+    Some(match kind {
+        1 => LspCompletionKind::Text,
+        2 => LspCompletionKind::Method,
+        3 => LspCompletionKind::Function,
+        4 => LspCompletionKind::Constructor,
+        5 => LspCompletionKind::Field,
+        6 => LspCompletionKind::Variable,
+        7 => LspCompletionKind::Class,
+        8 => LspCompletionKind::Interface,
+        9 => LspCompletionKind::Module,
+        10 => LspCompletionKind::Property,
+        11 => LspCompletionKind::Unit,
+        12 => LspCompletionKind::Value,
+        13 => LspCompletionKind::Enum,
+        14 => LspCompletionKind::Keyword,
+        15 => LspCompletionKind::Snippet,
+        16 => LspCompletionKind::Color,
+        17 => LspCompletionKind::File,
+        18 => LspCompletionKind::Reference,
+        19 => LspCompletionKind::Folder,
+        20 => LspCompletionKind::EnumMember,
+        21 => LspCompletionKind::Constant,
+        22 => LspCompletionKind::Struct,
+        23 => LspCompletionKind::Event,
+        24 => LspCompletionKind::Operator,
+        25 => LspCompletionKind::TypeParameter,
+        _ => return None,
     })
 }
 
@@ -2659,117 +3269,84 @@ fn decode_lsp_snippet(text: &str) -> String {
     out
 }
 
-struct TreeUiOutcome {
-    open_file: Option<PathBuf>,
-    selected_path: Option<PathBuf>,
-    action: Option<TreeAction>,
+fn completion_match_text(item: &LspCompletionItem) -> &str {
+    if item.insert_text.starts_with('\\') {
+        &item.insert_text
+    } else {
+        &item.label
+    }
 }
 
-fn show_directory_tree(
-    ui: &mut egui::Ui,
-    root: &Path,
-    current_file: Option<&Path>,
-    selected_path: Option<&Path>,
-    file_new_name: &mut String,
-    can_paste: bool,
-) -> TreeUiOutcome {
-    let mut outcome = TreeUiOutcome {
-        open_file: None,
-        selected_path: None,
-        action: None,
-    };
-    for entry in read_directory_entries(root) {
-        let path = entry.path();
-        let name = display_name(&path);
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            let icon = file_icon(&path, true);
-            let header = egui::CollapsingHeader::new(
-                RichText::new(format!("{} {}", icon.label, name)).color(icon.color),
-            )
-                .id_salt(path.to_string_lossy().to_string())
-                .default_open(path == root);
-            let header_output = header.show(ui, |ui| {
-                let child = show_directory_tree(
-                    ui,
-                    &path,
-                    current_file,
-                    selected_path,
-                    file_new_name,
-                    can_paste,
-                );
-                if outcome.open_file.is_none() {
-                    outcome.open_file = child.open_file;
-                }
-                if outcome.selected_path.is_none() {
-                    outcome.selected_path = child.selected_path;
-                }
-                if outcome.action.is_none() {
-                    outcome.action = child.action;
-                }
-            });
-            if header_output.header_response.clicked() {
-                outcome.selected_path = Some(path.clone());
-            }
-            header_output.header_response.context_menu(|ui| {
-                show_tree_context_menu(
-                    ui,
-                    &path,
-                    file_new_name,
-                    can_paste,
-                    &mut outcome.action,
-                    true,
-                );
-                if ui.button("copy").clicked() {
-                    outcome.action = Some(TreeAction::Copy(path.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("cut").clicked() {
-                    outcome.action = Some(TreeAction::Cut(path.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("delete").clicked() {
-                    outcome.action = Some(TreeAction::Delete(path.clone()));
-                    ui.close_menu();
-                }
-            });
-        } else {
-            let is_current = current_file == Some(path.as_path());
-            let is_selected = selected_path == Some(path.as_path());
-            let icon = file_icon(&path, false);
-            let response = ui.selectable_label(
-                is_current || is_selected,
-                RichText::new(format!("{} {}", icon.label, name))
-                    .monospace()
-                    .color(icon.color),
-            );
-            if response.clicked() {
-                outcome.selected_path = Some(path.clone());
-                if is_editor_text_path(&path) {
-                    outcome.open_file = Some(path.clone());
-                }
-            }
-            response.context_menu(|ui| {
-                let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone());
-                if ui.button("paste").clicked() {
-                    outcome.action = Some(TreeAction::Paste(parent.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("copy").clicked() {
-                    outcome.action = Some(TreeAction::Copy(path.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("cut").clicked() {
-                    outcome.action = Some(TreeAction::Cut(path.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("delete").clicked() {
-                    outcome.action = Some(TreeAction::Delete(path.clone()));
-                    ui.close_menu();
-                }
-            });
-        }
+fn completion_kind_badge(item: &LspCompletionItem, environment_context: bool) -> (&'static str, Color32) {
+    let text = completion_match_text(item);
+    if environment_context || text.starts_with("\\begin") || text.starts_with("\\end") {
+        return ("env", Color32::from_rgb(86, 211, 194));
     }
-    outcome
+    if text.starts_with('\\') {
+        return ("cmd", Color32::from_rgb(88, 166, 255));
+    }
+    match item.kind {
+        Some(LspCompletionKind::Snippet) => ("snp", Color32::from_rgb(180, 120, 255)),
+        Some(LspCompletionKind::Keyword | LspCompletionKind::Operator) => {
+            ("kw", Color32::from_rgb(255, 166, 87))
+        }
+        Some(LspCompletionKind::File | LspCompletionKind::Folder) => {
+            ("fs", Color32::from_rgb(120, 200, 140))
+        }
+        Some(LspCompletionKind::Class | LspCompletionKind::Struct | LspCompletionKind::Interface) => {
+            ("typ", Color32::from_rgb(86, 211, 194))
+        }
+        Some(LspCompletionKind::Variable | LspCompletionKind::Field | LspCompletionKind::Property) => {
+            ("var", Color32::from_rgb(229, 192, 123))
+        }
+        Some(LspCompletionKind::Function | LspCompletionKind::Method | LspCompletionKind::Constructor) => {
+            ("fn", Color32::from_rgb(88, 166, 255))
+        }
+        _ => ("txt", Color32::from_rgb(140, 140, 140)),
+    }
+}
+
+fn completion_label_color(item: &LspCompletionItem, environment_context: bool) -> Color32 {
+    let text = completion_match_text(item);
+    if environment_context || text.starts_with("\\begin") || text.starts_with("\\end") {
+        return Color32::from_rgb(126, 230, 214);
+    }
+    if text.starts_with('\\') {
+        return Color32::from_rgb(132, 201, 255);
+    }
+    match item.kind {
+        Some(LspCompletionKind::Keyword | LspCompletionKind::Operator) => {
+            Color32::from_rgb(255, 196, 122)
+        }
+        Some(LspCompletionKind::Snippet) => Color32::from_rgb(212, 168, 255),
+        Some(LspCompletionKind::File | LspCompletionKind::Folder) => {
+            Color32::from_rgb(152, 224, 168)
+        }
+        Some(LspCompletionKind::Class | LspCompletionKind::Struct | LspCompletionKind::Interface) => {
+            Color32::from_rgb(126, 230, 214)
+        }
+        Some(LspCompletionKind::Variable | LspCompletionKind::Field | LspCompletionKind::Property) => {
+            Color32::from_rgb(240, 210, 138)
+        }
+        Some(LspCompletionKind::Function | LspCompletionKind::Method | LspCompletionKind::Constructor) => {
+            Color32::from_rgb(132, 201, 255)
+        }
+        _ => Color32::from_rgb(232, 232, 232),
+    }
+}
+
+fn completion_detail_preview(item: &LspCompletionItem) -> Option<String> {
+    let detail = item.detail.as_ref()?;
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() > 28 {
+        let shortened: String = trimmed.chars().take(28).collect();
+        Some(format!("{shortened}..."))
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 fn read_directory_entries(root: &Path) -> Vec<fs::DirEntry> {
@@ -2780,6 +3357,25 @@ fn read_directory_entries(root: &Path) -> Vec<fs::DirEntry> {
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by(|a, b| compare_dir_entries(a, b));
     entries
+}
+
+fn build_file_node(path: &Path) -> FileNode {
+    let is_dir = path.is_dir();
+    let children = if is_dir {
+        read_directory_entries(path)
+            .into_iter()
+            .filter(|entry| !should_skip_in_file_tree(&entry.path()))
+            .map(|entry| build_file_node(&entry.path()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    FileNode {
+        path: path.to_path_buf(),
+        is_dir,
+        children,
+    }
 }
 
 fn compare_dir_entries(a: &fs::DirEntry, b: &fs::DirEntry) -> std::cmp::Ordering {
@@ -2795,12 +3391,11 @@ fn compare_dir_entries(a: &fs::DirEntry, b: &fs::DirEntry) -> std::cmp::Ordering
     }
 }
 
-fn selected_path_target_dir(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf())
-    }
+fn should_skip_in_file_tree(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| matches!(name, "target" | ".git"))
+        .unwrap_or(false)
 }
 
 fn unique_destination_path(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
@@ -2908,17 +3503,16 @@ fn is_editor_text_path(path: &Path) -> bool {
     )
 }
 
-struct FileIcon {
-    label: &'static str,
-    color: Color32,
+fn is_read_only_editor_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("log"))
+        .unwrap_or(false)
 }
 
-fn file_icon(path: &Path, is_dir: bool) -> FileIcon {
+fn tree_item_icon(path: &Path, is_dir: bool) -> &'static str {
     if is_dir {
-        FileIcon {
-            label: "[D]",
-            color: Color32::from_rgb(220, 180, 80),
-        }
+        "📁"
     } else {
         match path
             .extension()
@@ -2926,34 +3520,13 @@ fn file_icon(path: &Path, is_dir: bool) -> FileIcon {
             .map(|ext| ext.to_ascii_lowercase())
             .as_deref()
         {
-            Some("tex") => FileIcon {
-                label: "[T]",
-                color: Color32::from_rgb(90, 170, 255),
-            },
-            Some("log") => FileIcon {
-                label: "[L]",
-                color: Color32::from_rgb(240, 170, 90),
-            },
-            Some("bib") => FileIcon {
-                label: "[B]",
-                color: Color32::from_rgb(120, 210, 150),
-            },
-            Some("sty") | Some("cls") => FileIcon {
-                label: "[S]",
-                color: Color32::from_rgb(210, 150, 90),
-            },
-            Some("pdf") => FileIcon {
-                label: "[P]",
-                color: Color32::from_rgb(220, 90, 90),
-            },
-            Some("png") | Some("jpg") | Some("jpeg") | Some("svg") => FileIcon {
-                label: "[I]",
-                color: Color32::from_rgb(180, 140, 240),
-            },
-            _ => FileIcon {
-                label: "[F]",
-                color: Color32::from_rgb(170, 170, 170),
-            },
+            Some("tex") => "📘",
+            Some("log") => "🧾",
+            Some("bib") => "📚",
+            Some("sty") | Some("cls") => "🧩",
+            Some("pdf") => "📕",
+            Some("png") | Some("jpg") | Some("jpeg") | Some("svg") => "🖼",
+            _ => "📄",
         }
     }
 }
@@ -3596,12 +4169,12 @@ fn paint_line_number_gutter(
 ) {
     let painter = ui.painter();
     let visuals = ui.visuals();
-    painter.rect_filled(gutter_rect, 4.0, visuals.extreme_bg_color);
-    painter.rect_stroke(
-        gutter_rect,
-        4.0,
+    painter.line_segment(
+        [
+            egui::pos2(gutter_rect.right(), gutter_rect.top()),
+            egui::pos2(gutter_rect.right(), gutter_rect.bottom()),
+        ],
         egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
-        egui::StrokeKind::Inside,
     );
 
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
