@@ -3215,22 +3215,35 @@ fn ensure_default_templates_installed() {
     let Some(writable_root) = writable_templates_path() else {
         return;
     };
-    if directory_has_files(&writable_root) {
-        return;
+    for default_root in bundled_template_roots() {
+        copy_missing_template_files(&default_root, &writable_root);
     }
+}
 
-    let Some(default_root) = bundled_template_roots().into_iter().next() else {
+fn copy_missing_template_files(source_root: &Path, destination_root: &Path) {
+    let Ok(entries) = fs::read_dir(source_root) else {
         return;
     };
 
-    let _ = copy_path_recursively(&default_root, &writable_root);
-}
+    for entry in entries.flatten() {
+        let source_path = entry.path();
+        let relative = match source_path.strip_prefix(source_root) {
+            Ok(relative) => relative,
+            Err(_) => continue,
+        };
+        let destination_path = destination_root.join(relative);
 
-fn directory_has_files(path: &Path) -> bool {
-    fs::read_dir(path)
-        .ok()
-        .and_then(|mut entries| entries.next())
-        .is_some()
+        if source_path.is_dir() {
+            copy_missing_template_files(&source_path, &destination_path);
+            continue;
+        }
+
+        if destination_path.exists() {
+            continue;
+        }
+
+        let _ = copy_path_recursively(&source_path, &destination_path);
+    }
 }
 
 fn template_default_copy_name(tex_path: &Path) -> String {
