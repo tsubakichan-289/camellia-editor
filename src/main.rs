@@ -5711,11 +5711,16 @@ fn fontconfig_japanese_font_path() -> Option<PathBuf> {
 }
 
 fn resolve_command_path(command: &str) -> Option<String> {
-    std::env::var_os("PATH")
+    preferred_bundled_command_paths(command)
         .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .flat_map(|dir| path_candidates_for_command(&dir, command))
         .find(|path| path.exists())
+        .or_else(|| {
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+                .flat_map(|dir| path_candidates_for_command(&dir, command))
+                .find(|path| path.exists())
+        })
         .or_else(|| known_command_paths(command).into_iter().find(|path| path.exists()))
         .map(|path| path.to_string_lossy().into_owned())
 }
@@ -5734,6 +5739,7 @@ fn known_command_paths(command: &str) -> Vec<PathBuf> {
         "pdftoppm" => find_poppler_command_candidates(command),
         "tectonic" => find_tectonic_command_candidates(command),
         "hunspell" => bundled_hunspell_command_paths(),
+        "texlab" => bundled_texlab_command_paths(),
         _ => Vec::new(),
     };
 
@@ -5755,6 +5761,28 @@ fn bundled_hunspell_command_paths() -> Vec<PathBuf> {
             ]
         })
         .collect()
+}
+
+fn bundled_texlab_command_paths() -> Vec<PathBuf> {
+    app_search_roots()
+        .into_iter()
+        .flat_map(|root| {
+            [
+                root.join("texlab.exe"),
+                root.join("texlab"),
+                root.join("dist-win64").join("texlab.exe"),
+                root.join("tools").join("texlab").join("texlab.exe"),
+                root.join("tools").join("texlab").join("dist-win64").join("texlab.exe"),
+            ]
+        })
+        .collect()
+}
+
+fn preferred_bundled_command_paths(command: &str) -> Vec<PathBuf> {
+    match command {
+        "texlab" => bundled_texlab_command_paths(),
+        _ => Vec::new(),
+    }
 }
 
 fn static_fallback_command_paths(command: &str) -> Vec<PathBuf> {
